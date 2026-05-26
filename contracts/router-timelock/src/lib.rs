@@ -30,7 +30,6 @@ pub enum DataKey {
     EmergencyCouncil,        // Vec<Address>
     RequiredApprovals,       // u32 (M in M-of-N)
     FastTrackApprovals(u64), // op_id -> Vec<Address> (who has approved)
-    FastTrackEnabled,        // bool
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
