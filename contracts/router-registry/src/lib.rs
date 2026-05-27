@@ -22,9 +22,10 @@ use soroban_sdk::{
 #[contracttype]
 pub enum DataKey {
     Admin,
-    Entry(String, u32), // (name, version) -> ContractEntry
-    Versions(String),   // name -> Vec<u32>
-    ContractNames,      // Vec<String> of all registered names
+    Entry(String, u32),    // (name, version) -> ContractEntry
+    Versions(String),      // name -> Vec<u32>
+    ContractNames,         // Vec<String> of all registered names
+    AddressIndex(Address), // address -> (name, version) for O(1) reverse lookup
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -173,6 +174,11 @@ impl RouterRegistry {
                 .instance()
                 .set(&DataKey::ContractNames, &names);
         }
+
+        // Update address index for O(1) reverse lookup
+        env.storage()
+            .instance()
+            .set(&DataKey::AddressIndex(entry.address.clone()), &(name.clone(), version));
 
         env.events()
             .publish((Symbol::new(&env, "contract_registered"),), (name, version));
@@ -325,6 +331,7 @@ impl RouterRegistry {
     /// * `caller` - The address initiating the call; must be the admin.
     /// * `name` - The human-readable name of the contract.
     /// * `version` - The version number to deprecate.
+    /// * `reason` - Optional human-readable reason for the deprecation.
     ///
     /// # Returns
     /// `Ok(())` on success.
@@ -490,37 +497,25 @@ impl RouterRegistry {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
-    /// Find the registry entry for a given contract address.
+    /// Find the registry entry for a given contract address (O(1) reverse lookup).
     ///
-    /// Returns the first entry found (search order: all names in registration order,
-    /// all versions in ascending order). Returns None if the address is not registered.
+    /// Uses the address index written by `register()` to look up the entry
+    /// in constant time. Returns `None` if the address is not registered.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment.
     /// * `address` - The contract address to look up.
     ///
     /// # Returns
-    /// An [`Option<ContractEntry>`] containing the entry if found, None otherwise.
+    /// An [`Option<ContractEntry>`] containing the entry if found, `None` otherwise.
     pub fn get_entry_by_address(env: Env, address: Address) -> Option<ContractEntry> {
-        let names: Vec<String> = env.storage()
+        let (name, version) = env
+            .storage()
             .instance()
-            .get(&DataKey::ContractNames)
-            .unwrap_or_else(|| Vec::new(&env));
-        
-        for name in names.iter() {
-            let versions = Self::get_versions_list(&env, &name);
-            for v in versions.iter() {
-                if let Some(entry) = env.storage()
-                    .instance()
-                    .get::<DataKey, ContractEntry>(&DataKey::Entry(name.clone(), v))
-                {
-                    if entry.address == address {
-                        return Some(entry);
-                    }
-                }
-            }
-        }
-        None
+            .get::<DataKey, (String, u32)>(&DataKey::AddressIndex(address))?;
+        env.storage()
+            .instance()
+            .get(&DataKey::Entry(name, version))
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -1170,5 +1165,24 @@ mod tests {
         let (env, _admin, client) = setup();
         let name = String::from_str(&env, "unknown");
         assert!(client.get_all_versions(&name).is_empty());
+    }
+
+    #[test]
+    fn test_get_entry_by_address_found() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let addr = Address::generate(&env);
+        client.register(&admin, &name, &addr, &1);
+        let entry = client.get_entry_by_address(&addr).unwrap();
+        assert_eq!(entry.address, addr);
+        assert_eq!(entry.name, name);
+        assert_eq!(entry.version, 1);
+    }
+
+    #[test]
+    fn test_get_entry_by_address_not_found() {
+        let (env, _admin, client) = setup();
+        let unknown = Address::generate(&env);
+        assert!(client.get_entry_by_address(&unknown).is_none());
     }
 }
