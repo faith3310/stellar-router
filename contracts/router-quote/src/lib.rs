@@ -484,8 +484,9 @@ impl RouterQuote {
         // Exchange rate placeholder
         let exchange_rate = String::from_str(&env, "0");
 
-        // Price impact (0 for now - would need more complex calculation)
-        let price_impact_bps = 0;
+        // Price impact: (amount_out - amount_in) * 10_000 / amount_in
+        // Negative means the user receives less than they put in (adverse).
+        let price_impact_bps = ((amount_out - amount_in) * 10_000 / amount_in) as i32;
 
         Ok(QuoteResponse {
             amount_out,
