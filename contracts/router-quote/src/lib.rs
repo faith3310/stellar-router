@@ -37,6 +37,8 @@ pub struct QuoteRequest {
     pub token_out: Address,
     /// The amount of token_in to swap
     pub amount_in: i128,
+    /// Slippage tolerance in basis points (e.g., 50 = 0.5%)
+    pub slippage_bps: u32,
 }
 
 /// Response containing quote details.
@@ -71,6 +73,7 @@ pub enum QuoteError {
     QuoteFailed = 3,
     InvalidRoute = 4,
     NotInitialized = 5,
+    InvalidSlippage = 6,
 }
 
 /// Request parameters for fee estimation.
@@ -140,6 +143,7 @@ impl RouterQuote {
     /// * `token_in` - The address of the token being sold.
     /// * `token_out` - The address of the token being bought.
     /// * `amount_in` - The amount of token_in to swap.
+    /// * `slippage_bps` - Slippage tolerance in basis points (e.g., 50 = 0.5%). Max 10000 (100%).
     ///
     /// # Returns
     /// A [`QuoteResponse`] containing the expected output amount, fees, and route details,
@@ -147,6 +151,7 @@ impl RouterQuote {
     ///
     /// # Errors
     /// * [`QuoteError::InvalidAmount`] — if `amount_in` is less than or equal to zero.
+    /// * [`QuoteError::InvalidSlippage`] — if `slippage_bps` exceeds 10000.
     /// * [`QuoteError::RouteNotFound`] — if the route name is not registered.
     /// * [`QuoteError::QuoteFailed`] — if the plugin's `get_quote` call fails.
     pub fn get_quote(
@@ -156,10 +161,14 @@ impl RouterQuote {
         token_in: Address,
         token_out: Address,
         amount_in: i128,
+        slippage_bps: u32,
     ) -> Result<QuoteResponse, QuoteError> {
         // Validate input
         if amount_in <= 0 {
             return Err(QuoteError::InvalidAmount);
+        }
+        if slippage_bps > 10_000 {
+            return Err(QuoteError::InvalidSlippage);
         }
 
         // Compute expiration timestamp from configurable TTL (default 300s)
@@ -199,8 +208,9 @@ impl RouterQuote {
         // Calculate fee (assuming 1% fee for now - in production this comes from the plugin)
         let fee_amount = amount_in * 1 / 100;
         
-        // Calculate min_amount_out with 0.5% slippage tolerance
-        let min_amount_out = amount_out * 999 / 1000;
+        // Calculate min_amount_out using caller-specified slippage_bps
+        // Formula: amount_out * (10000 - slippage_bps) / 10000
+        let min_amount_out = amount_out * (10_000 - slippage_bps as i128) / 10_000;
         
         // Exchange rate placeholder
         let exchange_rate = String::from_str(&env, "0");
@@ -245,6 +255,7 @@ impl RouterQuote {
                 req.token_in.clone(),
                 req.token_out.clone(),
                 req.amount_in,
+                req.slippage_bps,
             );
             
             match response {
