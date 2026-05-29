@@ -641,6 +641,46 @@ impl RouterQuote {
         }
         result
     }
+
+    /// Compare quotes across multiple routes and return the best one after
+    /// filtering out routes whose price impact exceeds `max_price_impact_bps`.
+    ///
+    /// "Best" is defined as the highest `amount_out` among the remaining routes.
+    ///
+    /// # Arguments
+    /// * `routes`               — Pre-computed quotes to compare (e.g. from `get_quote`).
+    /// * `max_price_impact_bps` — Maximum acceptable price impact in basis points
+    ///                            (e.g. 100 = 1%). Routes with `price_impact_bps`
+    ///                            more negative than `-max_price_impact_bps` are excluded.
+    ///
+    /// # Errors
+    /// * [`QuoteError::EmptyRoute`]   — `routes` is empty.
+    /// * [`QuoteError::QuoteFailed`]  — all routes were filtered out by the threshold.
+    pub fn compare_quotes(
+        env: Env,
+        routes: Vec<QuoteResponse>,
+        max_price_impact_bps: u32,
+    ) -> Result<QuoteResponse, QuoteError> {
+        if routes.is_empty() {
+            return Err(QuoteError::EmptyRoute);
+        }
+
+        let threshold = -(max_price_impact_bps as i32);
+        let mut best: Option<QuoteResponse> = None;
+
+        for quote in routes.iter() {
+            if quote.price_impact_bps < threshold {
+                continue;
+            }
+            match &best {
+                None => best = Some(quote),
+                Some(b) if quote.amount_out > b.amount_out => best = Some(quote),
+                _ => {}
+            }
+        }
+
+        best.ok_or(QuoteError::QuoteFailed)
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -931,11 +971,35 @@ mod tests {
 }
 
     #[test]
-    fn test_get_best_quote_selects_highest_amount_out() {
+    fn test_compare_quotes_selects_highest_amount_out() {
         let (env, client, double, triple) = setup();
         let ti = Address::generate(&env);
         let to = Address::generate(&env);
 
+        let mut routes = soroban_sdk::Vec::new(&env);
+        routes.push_back(client.get_quote(&double, &ti, &to, &1000, &0, &0, &6));
+        routes.push_back(client.get_quote(&triple, &ti, &to, &1000, &0, &0, &6));
+
+        // triple gives amount_out = 3000, double gives 2000 → triple wins
+        let best = client.compare_quotes(&routes, &10_000u32);
+        assert_eq!(best.amount_out, 3000);
+    }
+
+    #[test]
+    fn test_compare_quotes_filters_by_price_impact() {
+        let (env, client, double, triple) = setup();
+        let ti = Address::generate(&env);
+        let to = Address::generate(&env);
+
+        // Both plugins return more than amount_in so price_impact_bps > 0 (positive).
+        // Use a threshold of 0 bps — routes with price_impact_bps < 0 are excluded.
+        // Since both plugins return > amount_in, neither is filtered.
+        let mut routes = soroban_sdk::Vec::new(&env);
+        routes.push_back(client.get_quote(&double, &ti, &to, &1000, &0, &0, &6));
+        routes.push_back(client.get_quote(&triple, &ti, &to, &1000, &0, &0, &6));
+
+        let best = client.compare_quotes(&routes, &0u32);
+        assert_eq!(best.amount_out, 3000);
         let mut route1 = soroban_sdk::Vec::new(&env);
         route1.push_back(HopDescriptor { plugin: double, token_in: ti.clone(), token_out: to.clone(), fee_bps: 0 });
 
@@ -951,11 +1015,47 @@ mod tests {
     }
 
     #[test]
-    fn test_get_best_quote_single_route_returns_that_route() {
+    fn test_compare_quotes_all_filtered_returns_error() {
+        let (env, client, _, _) = setup();
+
+        // Construct a quote with a very negative price impact manually.
+        let bad_quote = QuoteResponse {
+            amount_out: 1,
+            total_fee_amount: 0,
+            min_amount_out: 1,
+            exchange_rate: 1,
+            precision: 6,
+            price_impact_bps: -5000, // -50% impact
+            hops: soroban_sdk::Vec::new(&env),
+        };
+
+        let mut routes = soroban_sdk::Vec::new(&env);
+        routes.push_back(bad_quote);
+
+        // Threshold of 100 bps (1%) — the -50% route is filtered out
+        let result = client.try_compare_quotes(&routes, &100u32);
+        assert_eq!(result, Err(Ok(QuoteError::QuoteFailed)));
+    }
+
+    #[test]
+    fn test_compare_quotes_empty_routes_returns_error() {
+        let (env, client, _, _) = setup();
+        let routes: soroban_sdk::Vec<QuoteResponse> = soroban_sdk::Vec::new(&env);
+        let result = client.try_compare_quotes(&routes, &100u32);
+        assert_eq!(result, Err(Ok(QuoteError::EmptyRoute)));
+    }
+
+    #[test]
+    fn test_compare_quotes_single_route_within_threshold() {
         let (env, client, double, _) = setup();
         let ti = Address::generate(&env);
         let to = Address::generate(&env);
 
+        let mut routes = soroban_sdk::Vec::new(&env);
+        routes.push_back(client.get_quote(&double, &ti, &to, &1000, &0, &0, &6));
+
+        let best = client.compare_quotes(&routes, &10_000u32);
+        assert_eq!(best.amount_out, 2000);
         let mut route = soroban_sdk::Vec::new(&env);
         route.push_back(HopDescriptor { plugin: double, token_in: ti.clone(), token_out: to.clone(), fee_bps: 0 });
 
