@@ -10,10 +10,11 @@
 //! - `op_queued` — Operation queued (op_id, target, eta)
 //! - `op_executed` — Operation executed (op_id, target)
 //! - `op_cancelled` — Operation cancelled (op_id)
+//! - `op_description_updated` — Operation description updated (op_id, new_description)
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, crypto::Hash, Address, Bytes, Env,
-    String, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, xdr::ToXdr, Address, Bytes, Env, String,
+    Symbol, Vec,
 };
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -118,7 +119,7 @@ impl RouterTimelock {
 
         // Derive op_id from description bytes + target bytes + eta
         let mut preimage = Bytes::new(&env);
-        preimage.append(&description.to_bytes());
+        preimage.append(&description.clone().to_xdr(&env));
         preimage.append(&target.clone().to_xdr(&env));
         let eta_bytes = eta.to_be_bytes();
         preimage.append(&Bytes::from_array(&env, &eta_bytes));
@@ -202,6 +203,47 @@ impl RouterTimelock {
 
         env.events()
             .publish((Symbol::new(&env, "op_executed"),), (op_id, op.target));
+
+        Ok(())
+    }
+
+    /// Update the description of a queued (not yet executed or cancelled) operation.
+    ///
+    /// Only the admin may call this. The operation must still be pending —
+    /// descriptions of executed or cancelled operations cannot be changed.
+    ///
+    /// Emits `op_description_updated` with `(op_id, new_description)`.
+    pub fn update_description(
+        env: Env,
+        caller: Address,
+        op_id: Bytes,
+        new_description: String,
+    ) -> Result<(), TimelockError> {
+        caller.require_auth();
+        Self::require_admin(&env, &caller)?;
+
+        let mut op: Op = env
+            .storage()
+            .instance()
+            .get(&DataKey::Op(op_id.clone()))
+            .ok_or(TimelockError::NotFound)?;
+
+        if op.executed {
+            return Err(TimelockError::AlreadyExecuted);
+        }
+        if op.cancelled {
+            return Err(TimelockError::Cancelled);
+        }
+
+        op.description = new_description.clone();
+        env.storage()
+            .instance()
+            .set(&DataKey::Op(op_id.clone()), &op);
+
+        env.events().publish(
+            (Symbol::new(&env, "op_description_updated"),),
+            (op_id, new_description),
+        );
 
         Ok(())
     }
@@ -546,11 +588,11 @@ mod tests {
     fn test_cancel_all_returns_correct_count() {
         let (env, admin, client) = setup();
         let target = Address::generate(&env);
-        let deps = Vec::new(&env);
 
         // Queue 5 operations
-        for i in 0..5 {
-            let desc = String::from_str(&env, &format!("op{}", i));
+        for desc_str in ["op0", "op1", "op2", "op3", "op4"] {
+            let desc = String::from_str(&env, desc_str);
+            let deps: Vec<Bytes> = Vec::new(&env);
             client.queue(&admin, &desc, &target, &3600, &deps);
         }
 
@@ -578,5 +620,130 @@ mod tests {
         // Note: cancel_all() needs to be implemented
         // let count = client.cancel_all(&admin);
         // assert_eq!(count, 0);
+    }
+
+    // ── update_description tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_update_description_succeeds() {
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let deps = Vec::new(&env);
+
+        let op_id = client.queue(&admin, &String::from_str(&env, "initial desc"), &target, &3600, &deps);
+        let new_desc = String::from_str(&env, "corrected desc");
+        client.update_description(&admin, &op_id, &new_desc);
+
+        let op = client.get_op(&op_id).unwrap();
+        assert_eq!(op.description, new_desc);
+    }
+
+    #[test]
+    fn test_update_description_emits_event() {
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let deps = Vec::new(&env);
+
+        let op_id = client.queue(&admin, &String::from_str(&env, "initial desc"), &target, &3600, &deps);
+        let new_desc = String::from_str(&env, "corrected desc");
+        client.update_description(&admin, &op_id, &new_desc);
+
+        let events = env.events().all();
+        let last = events.last().unwrap();
+
+        let topic: Symbol = last.1.get(0).unwrap().into_val(&env);
+        assert_eq!(topic, Symbol::new(&env, "op_description_updated"));
+
+        let (emitted_id, emitted_desc): (Bytes, String) = last.2.into_val(&env);
+        assert_eq!(emitted_id, op_id);
+        assert_eq!(emitted_desc, new_desc);
+    }
+
+    #[test]
+    fn test_update_description_on_executed_op_fails() {
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let deps = Vec::new(&env);
+
+        let op_id = client.queue(&admin, &String::from_str(&env, "initial desc"), &target, &3600, &deps);
+        env.ledger().with_mut(|l| l.timestamp += 3601);
+        client.execute(&admin, &op_id);
+
+        let result = client.try_update_description(
+            &admin,
+            &op_id,
+            &String::from_str(&env, "too late"),
+        );
+        assert_eq!(result, Err(Ok(TimelockError::AlreadyExecuted)));
+    }
+
+    #[test]
+    fn test_update_description_on_cancelled_op_fails() {
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let deps = Vec::new(&env);
+
+        let op_id = client.queue(&admin, &String::from_str(&env, "initial desc"), &target, &3600, &deps);
+        client.cancel(&admin, &op_id);
+
+        let result = client.try_update_description(
+            &admin,
+            &op_id,
+            &String::from_str(&env, "too late"),
+        );
+        assert_eq!(result, Err(Ok(TimelockError::Cancelled)));
+    }
+
+    #[test]
+    fn test_update_description_nonexistent_op_fails() {
+        let (env, admin, client) = setup();
+        let fake_id = Bytes::from_array(&env, &[0u8; 32]);
+
+        let result = client.try_update_description(
+            &admin,
+            &fake_id,
+            &String::from_str(&env, "ghost op"),
+        );
+        assert_eq!(result, Err(Ok(TimelockError::NotFound)));
+    }
+
+    #[test]
+    fn test_update_description_unauthorized_fails() {
+        let (env, admin, client) = setup();
+        let attacker = Address::generate(&env);
+        let target = Address::generate(&env);
+        let deps: Vec<Bytes> = Vec::new(&env);
+
+        let op_id = client.queue(
+            &admin,
+            &String::from_str(&env, "initial desc"),
+            &target,
+            &3600,
+            &deps,
+        );
+
+        let result = client.try_update_description(
+            &attacker,
+            &op_id,
+            &String::from_str(&env, "hacked"),
+        );
+        assert_eq!(result, Err(Ok(TimelockError::Unauthorized)));
+    }
+
+    #[test]
+    fn test_update_description_ready_op_succeeds() {
+        // An op that is past its ETA but not yet executed is still pending — update should work.
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let deps = Vec::new(&env);
+
+        let op_id = client.queue(&admin, &String::from_str(&env, "initial desc"), &target, &3600, &deps);
+        env.ledger().with_mut(|l| l.timestamp += 3601);
+
+        let new_desc = String::from_str(&env, "clarified before execution");
+        client.update_description(&admin, &op_id, &new_desc);
+
+        let op = client.get_op(&op_id).unwrap();
+        assert_eq!(op.description, new_desc);
     }
 }
