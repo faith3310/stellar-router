@@ -5,11 +5,15 @@
 //! Delayed execution queue for sensitive router configuration changes.
 //! Operations must wait a configurable minimum delay before execution.
 //! Operations can be cancelled before execution.
+//! Operations expire if not executed within `eta + grace_period_seconds`.
 //!
 //! ## Events (following naming convention: past tense verbs in snake_case)
 //! - `op_queued` — Operation queued (op_id, target, eta)
 //! - `op_executed` — Operation executed (op_id, target)
 //! - `op_cancelled` — Operation cancelled (op_id)
+//! - `op_queued`              — Operation queued (op_id, target, eta, grace_period_seconds)
+//! - `op_executed`            — Operation executed (op_id, target)
+//! - `op_cancelled`           — Operation cancelled (op_id)
 //! - `op_description_updated` — Operation description updated (op_id, new_description)
 
 use soroban_sdk::{
@@ -23,9 +27,14 @@ use soroban_sdk::{
 pub enum DataKey {
     Admin,
     MinDelay,
-    Operation(u64), // op_id -> TimelockOp
-    NextOpId,
+    Operation(u64), // legacy, unused
+    NextOpId,       // legacy, unused
     FastTrackEnabled,
+    OperationDeps(u64),      // legacy, unused
+    EmergencyCouncil,        // legacy, unused
+    RequiredApprovals,       // legacy, unused
+    FastTrackApprovals(u64), // legacy, unused
+    Op(Bytes),               // op_id -> Op
     OperationDeps(u64),      // op_id -> Vec<u64>
     EmergencyCouncil,        // Vec<Address>
     RequiredApprovals,       // u32 (M in M-of-N)
@@ -42,6 +51,10 @@ pub struct Op {
     pub description: String,
     pub target: Address,
     pub eta: u64,
+    /// Seconds after `eta` during which the operation may be executed.
+    /// After `eta + grace_period_seconds` the operation is considered expired
+    /// and can no longer be executed.
+    pub grace_period_seconds: u64,
     pub executed: bool,
     pub cancelled: bool,
 }
@@ -52,12 +65,14 @@ pub struct Op {
 pub enum OperationStatus {
     /// Queued and waiting for ETA to elapse.
     Queued,
-    /// ETA has elapsed but not yet executed.
+    /// ETA has elapsed, still within grace period, not yet executed.
     Ready,
     /// Successfully executed.
     Executed,
     /// Cancelled before execution.
     Cancelled,
+    /// Grace period has elapsed without execution; operation can no longer be executed.
+    Expired,
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -73,6 +88,8 @@ pub enum TimelockError {
     AlreadyExecuted = 6,
     Cancelled = 7,
     DelayTooShort = 8,
+    /// The grace period has elapsed; the operation can no longer be executed.
+    Expired = 9,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -93,13 +110,19 @@ impl RouterTimelock {
     }
 
     /// Queue an operation. Returns the op_id (SHA-256 of description + target + eta).
-    /// Emits `op_queued` with `(op_id, target, eta)`.
+    ///
+    /// `grace_period_seconds` defines the window after `eta` during which the
+    /// operation may be executed. Once `eta + grace_period_seconds` has elapsed
+    /// the operation is considered expired and can no longer be executed.
+    ///
+    /// Emits `op_queued` with `(op_id, target, eta, grace_period_seconds)`.
     pub fn queue(
         env: Env,
         proposer: Address,
         description: String,
         target: Address,
         delay: u64,
+        grace_period_seconds: u64,
         _deps: Vec<Bytes>,
     ) -> Result<Bytes, TimelockError> {
         proposer.require_auth();
@@ -131,6 +154,7 @@ impl RouterTimelock {
             description,
             target: target.clone(),
             eta,
+            grace_period_seconds,
             executed: false,
             cancelled: false,
         };
@@ -140,7 +164,7 @@ impl RouterTimelock {
 
         env.events().publish(
             (Symbol::new(&env, "op_queued"),),
-            (op_id.clone(), target, eta),
+            (op_id.clone(), target, eta, grace_period_seconds),
         );
 
         Ok(op_id)
@@ -170,7 +194,10 @@ impl RouterTimelock {
         Ok(())
     }
 
-    /// Execute a queued operation after its ETA has passed.
+    /// Execute a queued operation after its ETA has passed and before its grace period expires.
+    ///
+    /// Returns `TimelockError::NotReady` if called before `eta`.
+    /// Returns `TimelockError::Expired` if called after `eta + grace_period_seconds`.
     pub fn execute(env: Env, caller: Address, op_id: Bytes) -> Result<(), TimelockError> {
         caller.require_auth();
         router_common::require_admin_simple!(&env, &caller, &DataKey::Admin, TimelockError)?;
@@ -181,9 +208,21 @@ impl RouterTimelock {
             .get(&DataKey::Op(op_id.clone()))
             .ok_or(TimelockError::NotFound)?;
 
+        if op.cancelled {
+            return Err(TimelockError::Cancelled);
+        }
+        if op.executed {
+            return Err(TimelockError::AlreadyExecuted);
+        }
+
+        let now = env.ledger().timestamp();
+        if now < op.eta {
         Self::require_op_pending(&op)?;
         if env.ledger().timestamp() < op.eta {
             return Err(TimelockError::NotReady);
+        }
+        if now > op.eta + op.grace_period_seconds {
+            return Err(TimelockError::Expired);
         }
 
         op.executed = true;
@@ -909,18 +948,22 @@ mod tests {
     ///
     /// # Returns
     /// * `Cancelled` — if the operation was cancelled.
-    /// * `Executed` — if the operation was executed.
-    /// * `Ready` — if the ETA has elapsed but the operation has not been executed.
-    /// * `Queued` — if the ETA has not yet elapsed.
+    /// * `Executed`  — if the operation was executed.
+    /// * `Expired`   — if `now > eta + grace_period_seconds` (and not executed/cancelled).
+    /// * `Ready`     — if `now >= eta` and still within the grace period.
+    /// * `Queued`    — if `now < eta`.
     ///
     /// Returns `None` if no operation with `op_id` exists.
     pub fn get_operation_status(env: Env, op_id: Bytes) -> Option<OperationStatus> {
         let op: Op = env.storage().instance().get(&DataKey::Op(op_id))?;
+        let now = env.ledger().timestamp();
         let status = if op.cancelled {
             OperationStatus::Cancelled
         } else if op.executed {
             OperationStatus::Executed
-        } else if env.ledger().timestamp() >= op.eta {
+        } else if now > op.eta + op.grace_period_seconds {
+            OperationStatus::Expired
+        } else if now >= op.eta {
             OperationStatus::Ready
         } else {
             OperationStatus::Queued
@@ -1012,6 +1055,9 @@ mod tests {
         Bytes, Env, IntoVal, String,
     };
 
+    /// Default grace period used in most tests: 24 hours.
+    const GRACE: u64 = 86_400;
+
     fn setup() -> (Env, Address, RouterTimelockClient<'static>) {
         let env = Env::default();
         env.mock_all_auths();
@@ -1022,13 +1068,15 @@ mod tests {
         (env, admin, client)
     }
 
+    // ── queue ─────────────────────────────────────────────────────────────────
+
     #[test]
     fn test_queue_returns_op_id() {
         let (env, admin, client) = setup();
         let target = Address::generate(&env);
         let desc = String::from_str(&env, "upgrade oracle");
         let deps = Vec::new(&env);
-        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
+        let op_id = client.queue(&admin, &desc, &target, &3600, &GRACE, &deps);
         assert!(!op_id.is_empty());
     }
 
@@ -1039,7 +1087,7 @@ mod tests {
         let desc = String::from_str(&env, "upgrade oracle");
         let deps = Vec::new(&env);
 
-        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
+        let op_id = client.queue(&admin, &desc, &target, &3600, &GRACE, &deps);
 
         let events = env.events().all();
         let last = events.last().unwrap();
@@ -1048,12 +1096,13 @@ mod tests {
         let topic: Symbol = last.1.get(0).unwrap().into_val(&env);
         assert_eq!(topic, Symbol::new(&env, "op_queued"));
 
-        // Payload is (op_id, target, eta)
-        let (emitted_id, emitted_target, emitted_eta): (Bytes, Address, u64) =
+        // Payload is (op_id, target, eta, grace_period_seconds)
+        let (emitted_id, emitted_target, emitted_eta, emitted_grace): (Bytes, Address, u64, u64) =
             last.2.into_val(&env);
         assert_eq!(emitted_id, op_id);
         assert_eq!(emitted_target, target);
         assert!(emitted_eta > 0);
+        assert_eq!(emitted_grace, GRACE);
     }
 
     #[test]
@@ -1063,13 +1112,30 @@ mod tests {
         let desc = String::from_str(&env, "upgrade oracle");
         let deps = Vec::new(&env);
 
-        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
+        let op_id = client.queue(&admin, &desc, &target, &3600, &GRACE, &deps);
         let op = client.get_op(&op_id).unwrap();
 
         assert_eq!(op.target, target);
+        assert_eq!(op.grace_period_seconds, GRACE);
         assert!(!op.executed);
         assert!(!op.cancelled);
     }
+
+    #[test]
+    fn test_queue_stores_grace_period() {
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let desc = String::from_str(&env, "check grace stored");
+        let deps: Vec<Bytes> = Vec::new(&env);
+        let custom_grace: u64 = 7200;
+
+        let op_id = client.queue(&admin, &desc, &target, &3600, &custom_grace, &deps);
+        let op = client.get_op(&op_id).unwrap();
+
+        assert_eq!(op.grace_period_seconds, custom_grace);
+    }
+
+    // ── execute ───────────────────────────────────────────────────────────────
 
     #[test]
     fn test_execute_before_eta_fails() {
@@ -1078,7 +1144,7 @@ mod tests {
         let desc = String::from_str(&env, "upgrade oracle");
         let deps = Vec::new(&env);
 
-        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
+        let op_id = client.queue(&admin, &desc, &target, &3600, &GRACE, &deps);
         let result = client.try_execute(&admin, &op_id);
         assert_eq!(result, Err(Ok(TimelockError::NotReady)));
     }
@@ -1090,7 +1156,7 @@ mod tests {
         let desc = String::from_str(&env, "upgrade oracle");
         let deps = Vec::new(&env);
 
-        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
+        let op_id = client.queue(&admin, &desc, &target, &3600, &GRACE, &deps);
         env.ledger().with_mut(|l| l.timestamp += 3601);
         client.execute(&admin, &op_id);
 
@@ -1099,17 +1165,36 @@ mod tests {
     }
 
     #[test]
-    fn test_cancel_op() {
+    fn test_execute_after_grace_period_fails() {
         let (env, admin, client) = setup();
         let target = Address::generate(&env);
         let desc = String::from_str(&env, "upgrade oracle");
-        let deps = Vec::new(&env);
+        let deps: Vec<Bytes> = Vec::new(&env);
+        let grace: u64 = 3600; // 1-hour grace window
 
-        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
-        client.cancel(&admin, &op_id);
+        let op_id = client.queue(&admin, &desc, &target, &3600, &grace, &deps);
+        // Jump past eta + grace_period_seconds
+        env.ledger().with_mut(|l| l.timestamp += 3600 + grace + 1);
+        let result = client.try_execute(&admin, &op_id);
+        assert_eq!(result, Err(Ok(TimelockError::Expired)));
+    }
+
+    #[test]
+    fn test_execute_at_grace_period_boundary_succeeds() {
+        // Execution exactly at eta + grace_period_seconds is still valid (inclusive boundary).
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let desc = String::from_str(&env, "boundary test");
+        let deps: Vec<Bytes> = Vec::new(&env);
+        let grace: u64 = 3600;
+
+        let op_id = client.queue(&admin, &desc, &target, &3600, &grace, &deps);
+        // Jump to exactly eta + grace_period_seconds
+        env.ledger().with_mut(|l| l.timestamp += 3600 + grace);
+        client.execute(&admin, &op_id);
 
         let op = client.get_op(&op_id).unwrap();
-        assert!(op.cancelled);
+        assert!(op.executed);
     }
 
     #[test]
@@ -1119,7 +1204,7 @@ mod tests {
         let desc = String::from_str(&env, "upgrade oracle");
         let deps = Vec::new(&env);
 
-        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
+        let op_id = client.queue(&admin, &desc, &target, &3600, &GRACE, &deps);
         client.cancel(&admin, &op_id);
         env.ledger().with_mut(|l| l.timestamp += 3601);
         let result = client.try_execute(&admin, &op_id);
@@ -1133,7 +1218,7 @@ mod tests {
         let desc = String::from_str(&env, "upgrade oracle");
         let deps = Vec::new(&env);
 
-        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
+        let op_id = client.queue(&admin, &desc, &target, &3600, &GRACE, &deps);
         env.ledger().with_mut(|l| l.timestamp += 3601);
         client.execute(&admin, &op_id);
         let result = client.try_execute(&admin, &op_id);
@@ -1141,13 +1226,66 @@ mod tests {
     }
 
     #[test]
+    fn test_execute_emits_op_executed_event() {
+        let (env, admin, client) = setup();
     fn test_set_min_delay_applies_to_new_ops_only() {
         let (env, admin, client) = setup(); // min_delay = 3600
         let target = Address::generate(&env);
         let desc = String::from_str(&env, "upgrade oracle");
         let deps = Vec::new(&env);
+
+        let op_id = client.queue(&admin, &desc, &target, &3600, &GRACE, &deps);
+        env.ledger().with_mut(|l| l.timestamp += 3601);
+        client.execute(&admin, &op_id);
+
+        let events = env.events().all();
+        let last = events.last().unwrap();
+        let topic: Symbol = last.1.get(0).unwrap().into_val(&env);
+        assert_eq!(topic, Symbol::new(&env, "op_executed"));
+    }
+
+    // ── cancel ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_cancel_op() {
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let desc = String::from_str(&env, "upgrade oracle");
+        let deps = Vec::new(&env);
+
+        let op_id = client.queue(&admin, &desc, &target, &3600, &GRACE, &deps);
+        client.cancel(&admin, &op_id);
+
+        let op = client.get_op(&op_id).unwrap();
+        assert!(op.cancelled);
+    }
+
+    #[test]
+    fn test_cancel_emits_op_cancelled_event() {
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let desc = String::from_str(&env, "upgrade oracle");
+        let deps = Vec::new(&env);
+
+        let op_id = client.queue(&admin, &desc, &target, &3600, &GRACE, &deps);
+        client.cancel(&admin, &op_id);
+
+        let events = env.events().all();
+        let last = events.last().unwrap();
+        let topic: Symbol = last.1.get(0).unwrap().into_val(&env);
+        assert_eq!(topic, Symbol::new(&env, "op_cancelled"));
+    }
+
+    // ── validation ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_delay_too_short_fails() {
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let desc = String::from_str(&env, "upgrade oracle");
+        let deps = Vec::new(&env);
         // min_delay is 3600, passing 100 should fail
-        let result = client.try_queue(&admin, &desc, &target, &100, &deps);
+        let result = client.try_queue(&admin, &desc, &target, &100, &GRACE, &deps);
         assert_eq!(result, Err(Ok(TimelockError::DelayTooShort)));
     }
 
@@ -1158,42 +1296,11 @@ mod tests {
         let target = Address::generate(&env);
         let desc = String::from_str(&env, "upgrade oracle");
         let deps = Vec::new(&env);
-        let result = client.try_queue(&attacker, &desc, &target, &3600, &deps);
+        let result = client.try_queue(&attacker, &desc, &target, &3600, &GRACE, &deps);
         assert_eq!(result, Err(Ok(TimelockError::Unauthorized)));
     }
 
-    #[test]
-    fn test_execute_emits_op_executed_event() {
-        let (env, admin, client) = setup();
-        let target = Address::generate(&env);
-        let desc = String::from_str(&env, "upgrade oracle");
-        let deps = Vec::new(&env);
-
-        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
-        env.ledger().with_mut(|l| l.timestamp += 3601);
-        client.execute(&admin, &op_id);
-
-        let events = env.events().all();
-        let last = events.last().unwrap();
-        let topic: Symbol = last.1.get(0).unwrap().into_val(&env);
-        assert_eq!(topic, Symbol::new(&env, "op_executed"));
-    }
-
-    #[test]
-    fn test_cancel_emits_op_cancelled_event() {
-        let (env, admin, client) = setup();
-        let target = Address::generate(&env);
-        let desc = String::from_str(&env, "upgrade oracle");
-        let deps = Vec::new(&env);
-
-        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
-        client.cancel(&admin, &op_id);
-
-        let events = env.events().all();
-        let last = events.last().unwrap();
-        let topic: Symbol = last.1.get(0).unwrap().into_val(&env);
-        assert_eq!(topic, Symbol::new(&env, "op_cancelled"));
-    }
+    // ── get_operation_status ──────────────────────────────────────────────────
 
     #[test]
     fn test_get_operation_status_queued() {
@@ -1201,7 +1308,7 @@ mod tests {
         let target = Address::generate(&env);
         let desc = String::from_str(&env, "upgrade oracle");
         let deps = Vec::new(&env);
-        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
+        let op_id = client.queue(&admin, &desc, &target, &3600, &GRACE, &deps);
         assert_eq!(client.get_operation_status(&op_id), Some(OperationStatus::Queued));
     }
 
@@ -1211,7 +1318,8 @@ mod tests {
         let target = Address::generate(&env);
         let desc = String::from_str(&env, "upgrade oracle");
         let deps = Vec::new(&env);
-        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
+        let op_id = client.queue(&admin, &desc, &target, &3600, &GRACE, &deps);
+        // Past ETA but still within grace period
         env.ledger().with_mut(|l| l.timestamp += 3601);
         assert_eq!(client.get_operation_status(&op_id), Some(OperationStatus::Ready));
     }
@@ -1222,7 +1330,7 @@ mod tests {
         let target = Address::generate(&env);
         let desc = String::from_str(&env, "upgrade oracle");
         let deps = Vec::new(&env);
-        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
+        let op_id = client.queue(&admin, &desc, &target, &3600, &GRACE, &deps);
         env.ledger().with_mut(|l| l.timestamp += 3601);
         client.execute(&admin, &op_id);
         assert_eq!(client.get_operation_status(&op_id), Some(OperationStatus::Executed));
@@ -1234,9 +1342,23 @@ mod tests {
         let target = Address::generate(&env);
         let desc = String::from_str(&env, "upgrade oracle");
         let deps = Vec::new(&env);
-        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
+        let op_id = client.queue(&admin, &desc, &target, &3600, &GRACE, &deps);
         client.cancel(&admin, &op_id);
         assert_eq!(client.get_operation_status(&op_id), Some(OperationStatus::Cancelled));
+    }
+
+    #[test]
+    fn test_get_operation_status_expired() {
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let desc = String::from_str(&env, "upgrade oracle");
+        let deps: Vec<Bytes> = Vec::new(&env);
+        let grace: u64 = 3600;
+
+        let op_id = client.queue(&admin, &desc, &target, &3600, &grace, &deps);
+        // Jump past eta + grace_period_seconds
+        env.ledger().with_mut(|l| l.timestamp += 3600 + grace + 1);
+        assert_eq!(client.get_operation_status(&op_id), Some(OperationStatus::Expired));
     }
 
     #[test]
@@ -1246,40 +1368,45 @@ mod tests {
         assert_eq!(client.get_operation_status(&fake_id), None);
     }
 
+    // ── update_description ────────────────────────────────────────────────────
+
     #[test]
-    fn test_cancel_all_with_mixed_states() {
+    fn test_update_description_succeeds() {
         let (env, admin, client) = setup();
         let target = Address::generate(&env);
         let deps = Vec::new(&env);
 
-        // Queue 3 operations
-        let op1 = client.queue(&admin, &String::from_str(&env, "op1"), &target, &3600, &deps);
-        let op2 = client.queue(&admin, &String::from_str(&env, "op2"), &target, &3600, &deps);
-        let op3 = client.queue(&admin, &String::from_str(&env, "op3"), &target, &3600, &deps);
+        let op_id = client.queue(&admin, &String::from_str(&env, "initial desc"), &target, &3600, &GRACE, &deps);
+        let new_desc = String::from_str(&env, "corrected desc");
+        client.update_description(&admin, &op_id, &new_desc);
 
-        // Execute op1
-        env.ledger().with_mut(|l| l.timestamp += 3601);
-        client.execute(&admin, &op1);
-
-        // Cancel op2
-        client.cancel(&admin, &op2);
-
-        // op3 remains pending
-
-        // cancel_all should only affect pending operations (op3)
-        // Expected: returns 1 (only op3 was cancelled)
-        // Note: cancel_all() needs to be implemented
-        // let count = client.cancel_all(&admin);
-        // assert_eq!(count, 1);
-
-        // Verify states after cancel_all
-        // assert_eq!(client.get_operation_status(&op1), Some(OperationStatus::Executed));
-        // assert_eq!(client.get_operation_status(&op2), Some(OperationStatus::Cancelled));
-        // assert_eq!(client.get_operation_status(&op3), Some(OperationStatus::Cancelled));
+        let op = client.get_op(&op_id).unwrap();
+        assert_eq!(op.description, new_desc);
     }
 
     #[test]
-    fn test_cancel_all_returns_correct_count() {
+    fn test_update_description_emits_event() {
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let deps = Vec::new(&env);
+
+        let op_id = client.queue(&admin, &String::from_str(&env, "initial desc"), &target, &3600, &GRACE, &deps);
+        let new_desc = String::from_str(&env, "corrected desc");
+        client.update_description(&admin, &op_id, &new_desc);
+
+        let events = env.events().all();
+        let last = events.last().unwrap();
+
+        let topic: Symbol = last.1.get(0).unwrap().into_val(&env);
+        assert_eq!(topic, Symbol::new(&env, "op_description_updated"));
+
+        let (emitted_id, emitted_desc): (Bytes, String) = last.2.into_val(&env);
+        assert_eq!(emitted_id, op_id);
+        assert_eq!(emitted_desc, new_desc);
+    }
+
+    #[test]
+    fn test_update_description_on_executed_op_fails() {
         let (env, admin, client) = setup();
         let target = Address::generate(&env);
 
@@ -1289,31 +1416,87 @@ mod tests {
             let deps: Vec<Bytes> = Vec::new(&env);
             client.queue(&admin, &desc, &target, &3600, &deps);
         }
+        let op_id = client.queue(&admin, &String::from_str(&env, "initial desc"), &target, &3600, &GRACE, &deps);
+        env.ledger().with_mut(|l| l.timestamp += 3601);
+        client.execute(&admin, &op_id);
 
-        // All 5 are pending, cancel_all should return 5
-        // Note: cancel_all() needs to be implemented
-        // let count = client.cancel_all(&admin);
-        // assert_eq!(count, 5);
+        let result = client.try_update_description(
+            &admin,
+            &op_id,
+            &String::from_str(&env, "too late"),
+        );
+        assert_eq!(result, Err(Ok(TimelockError::AlreadyExecuted)));
     }
 
     #[test]
-    fn test_cancel_all_with_no_pending_operations() {
+    fn test_update_description_on_cancelled_op_fails() {
         let (env, admin, client) = setup();
         let target = Address::generate(&env);
         let deps = Vec::new(&env);
 
-        // Queue and execute all operations
-        let op1 = client.queue(&admin, &String::from_str(&env, "op1"), &target, &3600, &deps);
-        let op2 = client.queue(&admin, &String::from_str(&env, "op2"), &target, &3600, &deps);
+        let op_id = client.queue(&admin, &String::from_str(&env, "initial desc"), &target, &3600, &GRACE, &deps);
+        client.cancel(&admin, &op_id);
 
+        let result = client.try_update_description(
+            &admin,
+            &op_id,
+            &String::from_str(&env, "too late"),
+        );
+        assert_eq!(result, Err(Ok(TimelockError::Cancelled)));
+    }
+
+    #[test]
+    fn test_update_description_nonexistent_op_fails() {
+        let (env, admin, client) = setup();
+        let fake_id = Bytes::from_array(&env, &[0u8; 32]);
+
+        let result = client.try_update_description(
+            &admin,
+            &fake_id,
+            &String::from_str(&env, "ghost op"),
+        );
+        assert_eq!(result, Err(Ok(TimelockError::NotFound)));
+    }
+
+    #[test]
+    fn test_update_description_unauthorized_fails() {
+        let (env, admin, client) = setup();
+        let attacker = Address::generate(&env);
+        let target = Address::generate(&env);
+        let deps: Vec<Bytes> = Vec::new(&env);
+
+        let op_id = client.queue(
+            &admin,
+            &String::from_str(&env, "initial desc"),
+            &target,
+            &3600,
+            &GRACE,
+            &deps,
+        );
+
+        let result = client.try_update_description(
+            &attacker,
+            &op_id,
+            &String::from_str(&env, "hacked"),
+        );
+        assert_eq!(result, Err(Ok(TimelockError::Unauthorized)));
+    }
+
+    #[test]
+    fn test_update_description_ready_op_succeeds() {
+        // An op that is past its ETA but not yet executed is still pending — update should work.
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let deps = Vec::new(&env);
+
+        let op_id = client.queue(&admin, &String::from_str(&env, "initial desc"), &target, &3600, &GRACE, &deps);
         env.ledger().with_mut(|l| l.timestamp += 3601);
-        client.execute(&admin, &op1);
-        client.execute(&admin, &op2);
 
-        // No pending operations, cancel_all should return 0
-        // Note: cancel_all() needs to be implemented
-        // let count = client.cancel_all(&admin);
-        // assert_eq!(count, 0);
+        let new_desc = String::from_str(&env, "clarified before execution");
+        client.update_description(&admin, &op_id, &new_desc);
+
+        let op = client.get_op(&op_id).unwrap();
+        assert_eq!(op.description, new_desc);
     }
 
     // ── update_description tests ──────────────────────────────────────────────
