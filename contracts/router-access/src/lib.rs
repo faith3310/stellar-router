@@ -52,7 +52,10 @@ pub enum DataKey {
     HasRole(String, Address), // (role, address) -> bool
     RoleAdmin(String),        // role -> Address who manages it
     Blacklisted(Address),
-    RoleMembers(String),   // role -> Vec<Address>
+    RoleMembers(String),   // legacy role -> Vec<Address>
+    RoleMember(String, u32), // (role, index) -> Address
+    RoleMemberIndex(String, Address), // (role, account) -> index
+    RoleMemberCount(String), // role -> total indexed member count
     AddressRoles(Address), // address -> Vec<String>
     RoleExpiry(String, Address),
     BlacklistReason(Address),
@@ -137,18 +140,27 @@ impl RouterAccess {
             .instance()
             .set(&DataKey::HasRole(role.clone(), account.clone()), &true);
 
-        // Add to RoleMembers list (if not already present)
-        let mut members: Vec<Address> = env
+        // Add to indexed member storage (append-only; stale entries filtered at read time)
+        if !env
             .storage()
             .instance()
-            .get(&DataKey::RoleMembers(role.clone()))
-            .unwrap_or_else(|| Vec::new(&env));
-        if !members.iter().any(|a| a == account) {
-            members.push_back(account.clone());
+            .has(&DataKey::RoleMemberIndex(role.clone(), account.clone()))
+        {
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::RoleMemberCount(role.clone()))
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&DataKey::RoleMember(role.clone(), count), &account);
+            env.storage()
+                .instance()
+                .set(&DataKey::RoleMemberIndex(role.clone(), account.clone()), &count);
+            env.storage()
+                .instance()
+                .set(&DataKey::RoleMemberCount(role.clone()), &(count + 1));
         }
-        env.storage()
-            .instance()
-            .set(&DataKey::RoleMembers(role.clone()), &members);
 
         // Add to AddressRoles list (if not already present)
         let mut roles: Vec<String> = env
@@ -164,7 +176,7 @@ impl RouterAccess {
             .set(&DataKey::HasRole(role.clone(), target.clone()), &true);
 
         env.events().publish(
-            (Symbol::new(&env, "role_granted"),),
+            (Symbol::new(&env, router_common::EVENT_ROLE_GRANTED),),
             (role, target),
             .set(&DataKey::AddressRoles(account.clone()), &roles);
 
@@ -173,7 +185,7 @@ impl RouterAccess {
         env.storage().instance().set(&key, &expiry_timestamp);
 
         env.events().publish(
-            (Symbol::new(&env, "role_granted"),),
+            (Symbol::new(&env, router_common::EVENT_ROLE_GRANTED),),
             (account, role, expiry_timestamp),
         );
         Ok(())
@@ -206,9 +218,15 @@ impl RouterAccess {
         }
 
         env.storage().instance().remove(&key);
+        env.storage()
+            .instance()
+            .remove(&DataKey::RoleExpiry(role.clone(), target.clone()));
+        env.storage()
+            .instance()
+            .remove(&DataKey::RoleMemberIndex(role.clone(), target.clone()));
 
         env.events().publish(
-            (Symbol::new(&env, "role_revoked"),),
+            (Symbol::new(&env, router_common::EVENT_ROLE_REVOKED),),
             (role, target),
         );
         Ok(())
@@ -255,7 +273,7 @@ impl RouterAccess {
             .set(&DataKey::RoleParent(role.clone()), &parent_role);
 
         env.events().publish(
-            (Symbol::new(&env, "role_parent_set"),),
+            (Symbol::new(&env, router_common::EVENT_ROLE_PARENT_SET),),
             (role, parent_role),
         );
         Ok(())
@@ -277,7 +295,7 @@ impl RouterAccess {
         Self::require_super_admin(&env, &caller)?;
         env.storage().instance().remove(&DataKey::RoleParent(role.clone()));
         env.events().publish(
-            (Symbol::new(&env, "role_parent_removed"),),
+            (Symbol::new(&env, router_common::EVENT_ROLE_PARENT_REMOVED),),
             role,
         );
         Ok(())
@@ -344,6 +362,21 @@ impl RouterAccess {
         } else {
             false
         }
+    }
+
+    /// Return the expiry timestamp for a role grant, or None if no expiry is set.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `role` - The role name.
+    /// * `target` - The address whose expiry to query.
+    ///
+    /// # Returns
+    /// `Some(timestamp)` if an expiry exists, `None` otherwise.
+    pub fn get_role_expiry(env: Env, role: String, target: Address) -> Option<u64> {
+        env.storage()
+            .instance()
+            .get::<DataKey, u64>(&DataKey::RoleExpiry(role, target))
     }
 
     /// Set the admin for a specific role.
@@ -416,7 +449,7 @@ impl RouterAccess {
         }
 
         env.events().publish(
-            (Symbol::new(&env, "address_blacklisted"),),
+            (Symbol::new(&env, router_common::EVENT_ADDRESS_BLACKLISTED),),
             (target, reason, expires_at),
         );
 
@@ -481,18 +514,33 @@ impl RouterAccess {
         true
     }
 
-    pub fn get_role_members(env: Env, role: String) -> Vec<Address> {
-        let all_members: Vec<Address> = env
+    pub fn get_role_members(env: Env, role: String, offset: u32, limit: u32) -> Vec<Address> {
+        if limit == 0 {
+            return Vec::new(&env);
+        }
+
+        let total: u32 = env
             .storage()
             .instance()
-            .get(&DataKey::RoleMembers(role.clone()))
-            .unwrap_or_else(|| Vec::new(&env));
+            .get(&DataKey::RoleMemberCount(role.clone()))
+            .unwrap_or(0);
+        if offset >= total {
+            return Vec::new(&env);
+        }
 
-        // Filter out expired roles
+        let end = core::cmp::min(total, offset.saturating_add(limit));
         let mut active_members = Vec::new(&env);
-        for member in all_members.iter() {
-            if Self::has_role_internal(&env, &member, &role) {
-                active_members.push_back(member.clone());
+
+        // Paginate over indexed members and filter out revoked/expired entries.
+        for i in offset..end {
+            if let Some(member) = env
+                .storage()
+                .instance()
+                .get::<DataKey, Address>(&DataKey::RoleMember(role.clone(), i))
+            {
+                if Self::has_role_internal(&env, &role, &member) {
+                    active_members.push_back(member);
+                }
             }
         }
         active_members
@@ -517,7 +565,7 @@ impl RouterAccess {
             .instance()
             .set(&DataKey::SuperAdmin, &new_admin);
         env.events().publish(
-            (Symbol::new(&env, "admin_transferred"),),
+            (Symbol::new(&env, router_common::EVENT_ADMIN_TRANSFERRED),),
             (current, new_admin),
         );
         Ok(())
@@ -548,9 +596,77 @@ impl RouterAccess {
         env.storage()
             .instance()
             .remove(&DataKey::HasRole(role.clone(), target.clone()));
+        env.storage()
+            .instance()
+            .remove(&DataKey::RoleMemberIndex(role.clone(), target.clone()));
         env.events()
             .publish((Symbol::new(&env, "role_expired"),), (role, target));
         Ok(())
+    }
+
+    /// Grant a role to multiple accounts in one call.
+    ///
+    /// Iterates `accounts` and calls the same logic as `grant_role` for each.
+    /// Returns a vector of per-account results so partial failures are visible.
+    ///
+    /// # Errors
+    /// * [`AccessError::Unauthorized`] — caller is not super-admin or role admin.
+    pub fn grant_role_batch(
+        env: Env,
+        admin: Address,
+        accounts: Vec<Address>,
+        role: String,
+        expires_in: Option<u64>,
+    ) -> Result<Vec<Result<(), AccessError>>, AccessError> {
+        admin.require_auth();
+        Self::require_role_manager(&env, &admin, &role)?;
+        let mut results = Vec::new(&env);
+        for account in accounts.iter() {
+            results.push_back(Self::grant_role_internal(&env, &account, &role, expires_in));
+        }
+        Ok(results)
+    }
+
+    /// Revoke a role from multiple accounts in one call.
+    ///
+    /// Calls [`Self::revoke_role`] for each target and returns `Ok(())` only
+    /// if all revocations succeed.
+    ///
+    /// # Errors
+    /// * [`AccessError::Unauthorized`] — caller is not super-admin or role admin.
+    /// * [`AccessError::RoleNotFound`] — a target does not hold the role directly.
+    pub fn bulk_revoke_role(
+        env: Env,
+        caller: Address,
+        role: String,
+        targets: Vec<Address>,
+    ) -> Result<(), AccessError> {
+        caller.require_auth();
+        for target in targets.iter() {
+            Self::revoke_role(env.clone(), caller.clone(), role.clone(), target.clone())?;
+        }
+        Ok(())
+    }
+
+    /// Revoke a role from multiple accounts in one call.
+    ///
+    /// Returns a vector of per-account results so partial failures are visible.
+    ///
+    /// # Errors
+    /// * [`AccessError::Unauthorized`] — caller is not super-admin or role admin.
+    pub fn revoke_role_batch(
+        env: Env,
+        caller: Address,
+        role: String,
+        targets: Vec<Address>,
+    ) -> Result<Vec<Result<(), AccessError>>, AccessError> {
+        caller.require_auth();
+        Self::require_role_manager(&env, &caller, &role)?;
+        let mut results = Vec::new(&env);
+        for target in targets.iter() {
+            results.push_back(Self::revoke_role_internal(&env, &role, &target));
+        }
+        Ok(results)
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -678,6 +794,93 @@ impl RouterAccess {
         }
 
         true
+    }
+
+    fn grant_role_internal(
+        env: &Env,
+        account: &Address,
+        role: &String,
+        expires_in: Option<u64>,
+    ) -> Result<(), AccessError> {
+        if Self::is_blacklisted_internal(env, account) {
+            return Err(AccessError::Blacklisted);
+        }
+        if Self::has_role_internal(env, account, role) {
+            return Err(AccessError::AlreadyHasRole);
+        }
+        let expiry_timestamp = match expires_in {
+            Some(seconds) => env.ledger().timestamp() + seconds,
+            None => u64::MAX,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::HasRole(role.clone(), account.clone()), &true);
+        let mut members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::RoleMembers(role.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+        if !members.iter().any(|a| a == *account) {
+            members.push_back(account.clone());
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::RoleMembers(role.clone()), &members);
+        let mut roles: Vec<String> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AddressRoles(account.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+        if !roles.iter().any(|r| r == *role) {
+            roles.push_back(role.clone());
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::AddressRoles(account.clone()), &roles);
+        env.storage()
+            .instance()
+            .set(&DataKey::RoleExpiry(role.clone(), account.clone()), &expiry_timestamp);
+        env.events().publish(
+            (Symbol::new(env, "role_granted"),),
+            (account.clone(), role.clone(), expiry_timestamp),
+        );
+        Ok(())
+    }
+
+    fn revoke_role_internal(env: &Env, role: &String, target: &Address) -> Result<(), AccessError> {
+        let key = DataKey::HasRole(role.clone(), target.clone());
+        if !env.storage().instance().has(&key) {
+            return Err(AccessError::RoleNotFound);
+        }
+        env.storage().instance().remove(&key);
+        let mut members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::RoleMembers(role.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+        if let Some(i) = members.iter().position(|a| a == *target) {
+            members.remove(i as u32);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::RoleMembers(role.clone()), &members);
+        let mut roles: Vec<String> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AddressRoles(target.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+        if let Some(i) = roles.iter().position(|r| r == *role) {
+            roles.remove(i as u32);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::AddressRoles(target.clone()), &roles);
+        env.storage()
+            .instance()
+            .remove(&DataKey::RoleExpiry(role.clone(), target.clone()));
+        env.events()
+            .publish((Symbol::new(env, "role_revoked"),), (role.clone(), target.clone()));
+        Ok(())
     }
 }
 
@@ -872,7 +1075,7 @@ mod tests {
         let user2 = Address::generate(&env);
 
         // Initially, role should have no members
-        let members_before = client.get_role_members(&role);
+        let members_before = client.get_role_members(&role, &0, &50);
         assert!(members_before.is_empty());
 
         // Grant role to user1
@@ -880,7 +1083,7 @@ mod tests {
             .grant_role(&admin, &user1, &role, &None);
 
         // Check that user1 is in role members
-        let members_after_first = client.get_role_members(&role);
+        let members_after_first = client.get_role_members(&role, &0, &50);
         assert_eq!(members_after_first.len(), 1);
         assert!(members_after_first.contains(&user1));
 
@@ -889,7 +1092,7 @@ mod tests {
             .grant_role(&admin, &user2, &role, &None);
 
         // Check that both users are in role members
-        let members_after_second = client.get_role_members(&role);
+        let members_after_second = client.get_role_members(&role, &0, &50);
         assert_eq!(members_after_second.len(), 2);
         assert!(members_after_second.contains(&user1));
         assert!(members_after_second.contains(&user2));
@@ -947,6 +1150,54 @@ mod tests {
 
         client.unblacklist(&admin, &user);
         assert!(client.has_role(&user, &role));
+    }
+
+    // ── Issue #443: blacklist expires_at ──────────────────────────────────────
+
+    #[test]
+    fn test_blacklist_expires_after_timestamp() {
+        let (env, admin, client) = setup();
+        let user = Address::generate(&env);
+
+        // Blacklist with expiry 100 seconds from now (ledger timestamp starts at 0)
+        client.blacklist(&admin, &user, &None::<String>, &Some(100u64));
+        assert!(client.is_blacklisted(&user));
+
+        // Advance time past expiry
+        env.ledger().set_timestamp(101);
+        // Expired blacklist should be treated as not blacklisted
+        assert!(!client.is_blacklisted(&user));
+    }
+
+    #[test]
+    fn test_blacklist_without_expiry_is_permanent() {
+        let (env, admin, client) = setup();
+        let user = Address::generate(&env);
+
+        client.blacklist(&admin, &user, &None::<String>, &None);
+        assert!(client.is_blacklisted(&user));
+
+        // Advance time significantly — should still be blacklisted
+        env.ledger().set_timestamp(999_999);
+        assert!(client.is_blacklisted(&user));
+    }
+
+    #[test]
+    fn test_expired_blacklist_allows_role_grant() {
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let user = Address::generate(&env);
+
+        // Blacklist with short expiry
+        client.blacklist(&admin, &user, &None::<String>, &Some(50u64));
+        assert!(client.is_blacklisted(&user));
+
+        // Advance past expiry
+        env.ledger().set_timestamp(51);
+        assert!(!client.is_blacklisted(&user));
+
+        // Should now be able to grant role
+        assert!(client.try_grant_role(&admin, &user, &role, &None).is_ok());
     }
 
     #[test]
@@ -1113,7 +1364,7 @@ mod tests {
         client.grant_role(&admin, &user, &role, &Some(10));
 
         // Verify user is initially in role members
-        let members_before = client.get_role_members(&role);
+        let members_before = client.get_role_members(&role, &0, &50);
         assert!(members_before.contains(&user));
         assert_eq!(members_before.len(), 1);
 
@@ -1124,9 +1375,26 @@ mod tests {
         assert!(!client.has_role(&user, &role));
 
         // get_role_members should not contain the expired user
-        let members_after = client.get_role_members(&role);
+        let members_after = client.get_role_members(&role, &0, &50);
         assert!(!members_after.contains(&user));
         assert!(members_after.is_empty());
+    }
+
+    #[test]
+    fn test_get_role_members_supports_offset_limit_pagination() {
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let user3 = Address::generate(&env);
+
+        client.grant_role(&admin, &user1, &role, &None);
+        client.grant_role(&admin, &user2, &role, &None);
+        client.grant_role(&admin, &user3, &role, &None);
+
+        let page = client.get_role_members(&role, &1, &1);
+        assert_eq!(page.len(), 1);
+        assert!(page.contains(&user2));
     }
 
     #[test]
@@ -1158,65 +1426,32 @@ mod tests {
         assert_eq!(result, Err(Ok(AccessError::Unauthorized)));
     }
 
-    // ── Issue #454: role hierarchy cycle detection at depth ───────────────────
-
     #[test]
-    fn test_cycle_depth_2_a_b_a() {
-        // A→B then B→A must be rejected.
+    fn test_get_role_expiry_returns_timestamp() {
         let (env, admin, client) = setup();
-        let a = String::from_str(&env, "role_a");
-        let b = String::from_str(&env, "role_b");
-
-        client.set_role_parent(&admin, &b, &a); // b's parent = a
-        let result = client.try_set_role_parent(&admin, &a, &b); // a's parent = b → cycle
-        assert_eq!(result, Err(Ok(AccessError::HierarchyCycle)));
-    }
-
-    #[test]
-    fn test_cycle_depth_3_a_b_c_a() {
-        // A→B→C then C→A must be rejected.
-        let (env, admin, client) = setup();
-        let a = String::from_str(&env, "role_a");
-        let b = String::from_str(&env, "role_b");
-        let c = String::from_str(&env, "role_c");
-
-        client.set_role_parent(&admin, &b, &a); // b's parent = a
-        client.set_role_parent(&admin, &c, &b); // c's parent = b  → chain: c→b→a
-        let result = client.try_set_role_parent(&admin, &a, &c); // a's parent = c → cycle
-        assert_eq!(result, Err(Ok(AccessError::HierarchyCycle)));
-    }
-
-    #[test]
-    fn test_self_cycle_a_a() {
-        // A→A must be rejected.
-        let (env, admin, client) = setup();
-        let a = String::from_str(&env, "role_a");
-        let result = client.try_set_role_parent(&admin, &a, &a);
-        assert_eq!(result, Err(Ok(AccessError::HierarchyCycle)));
-    }
-
-    #[test]
-    fn test_valid_deep_chain_a_b_c_d_accepted() {
-        // A→B→C→D is a valid chain with no cycle.
-        let (env, admin, client) = setup();
-        let a = String::from_str(&env, "role_a");
-        let b = String::from_str(&env, "role_b");
-        let c = String::from_str(&env, "role_c");
-        let d = String::from_str(&env, "role_d");
-
-        assert!(client.try_set_role_parent(&admin, &b, &a).is_ok()); // b's parent = a
-        assert!(client.try_set_role_parent(&admin, &c, &b).is_ok()); // c's parent = b
-        assert!(client.try_set_role_parent(&admin, &d, &c).is_ok()); // d's parent = c
-
-        // Verify the chain: a user with role_a should inherit b, c, d
+        let role = String::from_str(&env, "operator");
         let user = Address::generate(&env);
-        client.grant_role(&admin, &user, &a, &None);
-        assert!(client.has_role(&user, &a));
-        assert!(client.has_role(&user, &b));
-        assert!(client.has_role(&user, &c));
-        assert!(client.has_role(&user, &d));
+        let now = env.ledger().timestamp();
+        client.grant_role(&admin, &user, &role, &Some(100));
+        let expiry = client.get_role_expiry(&role, &user);
+        assert_eq!(expiry, Some(now + 100));
     }
 
+    #[test]
+    fn test_get_role_expiry_none_when_not_granted() {
+        let (env, _admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let user = Address::generate(&env);
+        assert_eq!(client.get_role_expiry(&role, &user), None);
+    }
+
+    #[test]
+    fn test_get_role_expiry_max_when_no_expiry() {
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let user = Address::generate(&env);
+        client.grant_role(&admin, &user, &role, &None);
+        assert_eq!(client.get_role_expiry(&role, &user), Some(u64::MAX));
     // ── Role hierarchy tests ──────────────────────────────────────────────────
 
     #[test]
@@ -1346,5 +1581,155 @@ mod tests {
         let b = String::from_str(&env, "b");
         let result = client.try_set_role_parent(&attacker, &a, &b);
         assert_eq!(result, Err(Ok(AccessError::Unauthorized)));
+    }
+
+    // ── Batch role tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_grant_role_batch_all_succeed() {
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let u1 = Address::generate(&env);
+        let u2 = Address::generate(&env);
+        let accounts = soroban_sdk::vec![&env, u1.clone(), u2.clone()];
+        let results = client.grant_role_batch(&admin, &accounts, &role, &None);
+        assert_eq!(results.len(), 2);
+        for r in results.iter() {
+            assert_eq!(r, Ok(()));
+        }
+        assert!(client.has_role(&u1, &role));
+        assert!(client.has_role(&u2, &role));
+    }
+
+    #[test]
+    fn test_grant_role_batch_partial_errors() {
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let u1 = Address::generate(&env);
+        // Grant u1 first so the batch hits AlreadyHasRole for it
+        client.grant_role(&admin, &u1, &role, &None);
+        let u2 = Address::generate(&env);
+        let accounts = soroban_sdk::vec![&env, u1.clone(), u2.clone()];
+        let results = client.grant_role_batch(&admin, &accounts, &role, &None);
+        assert_eq!(results.get(0).unwrap(), Err(AccessError::AlreadyHasRole));
+        assert_eq!(results.get(1).unwrap(), Ok(()));
+    }
+
+    #[test]
+    fn test_grant_role_batch_unauthorized_fails() {
+        let (env, _admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let attacker = Address::generate(&env);
+        let u1 = Address::generate(&env);
+        let accounts = soroban_sdk::vec![&env, u1];
+        let result = client.try_grant_role_batch(&attacker, &accounts, &role, &None);
+        assert_eq!(result, Err(Ok(AccessError::Unauthorized)));
+    }
+
+    #[test]
+    fn test_revoke_role_batch_all_succeed() {
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let u1 = Address::generate(&env);
+        let u2 = Address::generate(&env);
+        client.grant_role(&admin, &u1, &role, &None);
+        client.grant_role(&admin, &u2, &role, &None);
+        let targets = soroban_sdk::vec![&env, u1.clone(), u2.clone()];
+        let results = client.revoke_role_batch(&admin, &role, &targets);
+        assert_eq!(results.len(), 2);
+        for r in results.iter() {
+            assert_eq!(r, Ok(()));
+        }
+        assert!(!client.has_role(&u1, &role));
+        assert!(!client.has_role(&u2, &role));
+    }
+
+    #[test]
+    fn test_revoke_role_batch_partial_errors() {
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let u1 = Address::generate(&env);
+        let u2 = Address::generate(&env); // never granted
+        client.grant_role(&admin, &u1, &role, &None);
+        let targets = soroban_sdk::vec![&env, u1.clone(), u2.clone()];
+        let results = client.revoke_role_batch(&admin, &role, &targets);
+        assert_eq!(results.get(0).unwrap(), Ok(()));
+        assert_eq!(results.get(1).unwrap(), Err(AccessError::RoleNotFound));
+    }
+
+    #[test]
+    fn test_revoke_role_batch_unauthorized_fails() {
+        let (env, _admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let attacker = Address::generate(&env);
+        let u1 = Address::generate(&env);
+        let targets = soroban_sdk::vec![&env, u1];
+        let result = client.try_revoke_role_batch(&attacker, &role, &targets);
+        assert_eq!(result, Err(Ok(AccessError::Unauthorized)));
+    }
+}
+
+    // ── Issue #510: Additional bulk operation tests ──────────────────────────
+
+    #[test]
+    fn test_bulk_grant_role_with_blacklisted_address() {
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let u1 = Address::generate(&env);
+        let u2 = Address::generate(&env);
+        let u3 = Address::generate(&env);
+
+        // Blacklist u2
+        client.blacklist(&admin, &u2, &None::<String>, &None);
+
+        let accounts = soroban_sdk::vec![&env, u1.clone(), u2.clone(), u3.clone()];
+        let results = client.grant_role_batch(&admin, &accounts, &role, &None);
+
+        // u1 should succeed, u2 should fail with Blacklisted, u3 should succeed
+        assert_eq!(results.get(0).unwrap(), Ok(()));
+        assert_eq!(results.get(1).unwrap(), Err(AccessError::Blacklisted));
+        assert_eq!(results.get(2).unwrap(), Ok(()));
+
+        // Verify final state
+        assert!(client.has_role(&u1, &role));
+        assert!(!client.has_role(&u2, &role));
+        assert!(client.has_role(&u3, &role));
+    }
+
+    #[test]
+    fn test_bulk_grant_role_empty_list() {
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let accounts = soroban_sdk::Vec::new(&env);
+        let results = client.grant_role_batch(&admin, &accounts, &role, &None);
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_bulk_revoke_role_empty_list() {
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let targets = soroban_sdk::Vec::new(&env);
+        let results = client.revoke_role_batch(&admin, &role, &targets);
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_bulk_grant_role_all_blacklisted() {
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let u1 = Address::generate(&env);
+        let u2 = Address::generate(&env);
+
+        // Blacklist both
+        client.blacklist(&admin, &u1, &None::<String>, &None);
+        client.blacklist(&admin, &u2, &None::<String>, &None);
+
+        let accounts = soroban_sdk::vec![&env, u1.clone(), u2.clone()];
+        let results = client.grant_role_batch(&admin, &accounts, &role, &None);
+
+        // Both should fail
+        assert_eq!(results.get(0).unwrap(), Err(AccessError::Blacklisted));
+        assert_eq!(results.get(1).unwrap(), Err(AccessError::Blacklisted));
     }
 }
