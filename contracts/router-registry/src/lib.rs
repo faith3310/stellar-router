@@ -314,6 +314,28 @@ impl RouterRegistry {
             .ok_or(RegistryError::NotFound)
     }
 
+    /// Check whether a contract entry exists for the given name and version.
+    ///
+    /// A cheaper alternative to [`get`] when the caller only needs to know
+    /// whether an entry is present. Uses a storage `has` check, which avoids
+    /// deserializing the full [`ContractEntry`].
+    ///
+    /// Note: returns `true` even for deprecated entries — it reflects storage
+    /// presence, not active status.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `name` - The human-readable name of the contract.
+    /// * `version` - The exact version number to check.
+    ///
+    /// # Returns
+    /// `true` if an entry exists for `(name, version)`, `false` otherwise.
+    pub fn is_registered(env: Env, name: String, version: u32) -> bool {
+        env.storage()
+            .instance()
+            .has(&DataKey::Entry(name, version))
+    }
+
     /// Get the latest (highest version) non-deprecated entry for a name.
     ///
     /// Iterates registered versions in descending order and returns the first
@@ -1596,5 +1618,51 @@ mod tests {
         
         let names = client.get_all_names();
         assert_eq!(names.len(), 2);
+    }
+
+    // ── is_registered ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_is_registered_returns_true_for_existing_entry() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let addr = Address::generate(&env);
+        client.register(&admin, &name, &addr, &1);
+        assert!(client.is_registered(&name, &1));
+    }
+
+    #[test]
+    fn test_is_registered_returns_false_for_unknown_name() {
+        let (env, _admin, client) = setup();
+        let name = String::from_str(&env, "nonexistent");
+        assert!(!client.is_registered(&name, &1));
+    }
+
+    #[test]
+    fn test_is_registered_returns_false_for_unknown_version() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let addr = Address::generate(&env);
+        client.register(&admin, &name, &addr, &1);
+        assert!(!client.is_registered(&name, &99));
+    }
+
+    #[test]
+    fn test_is_registered_returns_true_for_deprecated_entry() {
+        // is_registered reflects storage presence, not active status.
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let addr = Address::generate(&env);
+        client.register(&admin, &name, &addr, &1);
+        client.deprecate(&admin, &name, &1, &None::<String>);
+        assert!(client.is_registered(&name, &1));
+    }
+
+    #[test]
+    fn test_is_registered_version_zero_always_false() {
+        // version 0 is rejected by register(), so it can never be stored.
+        let (env, _admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        assert!(!client.is_registered(&name, &0));
     }
 }
