@@ -411,6 +411,18 @@ impl RouterAccess {
             .get::<DataKey, Address>(&DataKey::RoleAdmin(role))
     }
 
+    /// Returns `true` if `addr` is the designated admin for `role`.
+    ///
+    /// Convenience wrapper around [`Self::get_role_admin`] that avoids
+    /// callers having to unwrap an `Option` and compare addresses themselves.
+    pub fn is_role_admin(env: Env, role: String, addr: Address) -> bool {
+        env.storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::RoleAdmin(role))
+            .map(|admin| admin == addr)
+            .unwrap_or(false)
+    }
+
     /// Blacklist an address.
     pub fn blacklist(
         env: Env,
@@ -1414,6 +1426,38 @@ mod tests {
         let role = String::from_str(&env, "operator");
 
         assert_eq!(client.get_role_admin(&role), None);
+    }
+
+    #[test]
+    fn test_is_role_admin_returns_true_for_designated_admin() {
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let role_admin = Address::generate(&env);
+
+        client.set_role_admin(&admin, &role, &role_admin);
+
+        assert!(client.is_role_admin(&role, &role_admin));
+    }
+
+    #[test]
+    fn test_is_role_admin_returns_false_for_non_admin() {
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let role_admin = Address::generate(&env);
+        let other = Address::generate(&env);
+
+        client.set_role_admin(&admin, &role, &role_admin);
+
+        assert!(!client.is_role_admin(&role, &other));
+    }
+
+    #[test]
+    fn test_is_role_admin_returns_false_when_no_admin_set() {
+        let (env, _admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let addr = Address::generate(&env);
+
+        assert!(!client.is_role_admin(&role, &addr));
     }
 
     #[test]
