@@ -129,6 +129,109 @@ pub const EVENT_CONTRACT_REGISTERED: &str = "contract_registered";
 /// Standard event topic for contract deprecation in registry
 pub const EVENT_CONTRACT_DEPRECATED: &str = "contract_deprecated";
 
+// ── Batch types ───────────────────────────────────────────────────────────────
+
+use soroban_sdk::{contracttype, Address, Env, String, Symbol, Vec};
+
+/// Per-call result payload used by multicall batch operations.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CallResult {
+    pub target: Address,
+    pub function: Symbol,
+    pub success: bool,
+}
+
+/// Indexed success entry for void batch operations.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchSuccess {
+    pub index: u32,
+}
+
+/// Indexed success entry for call batch operations.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchCallSuccess {
+    pub index: u32,
+    pub result: CallResult,
+}
+
+/// Indexed failure entry for batch operations.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchFailure {
+    pub index: u32,
+    pub message: String,
+}
+
+/// Standardized per-index batch operation result for void operations (`T = BatchUnit`).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchResult {
+    pub successes: Vec<BatchSuccess>,
+    pub failures: Vec<BatchFailure>,
+}
+
+/// Standardized per-index batch operation result for call operations (`T = CallResult`).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchCallResult {
+    pub successes: Vec<BatchCallSuccess>,
+    pub failures: Vec<BatchFailure>,
+}
+
+impl BatchResult {
+    pub fn new(env: &Env) -> Self {
+        Self {
+            successes: Vec::new(env),
+            failures: Vec::new(env),
+        }
+    }
+
+    pub fn record_success(&mut self, index: u32) {
+        self.successes.push_back(BatchSuccess { index });
+    }
+
+    pub fn record_failure(&mut self, env: &Env, index: u32, message: &str) {
+        self.failures.push_back(BatchFailure {
+            index,
+            message: String::from_str(env, message),
+        });
+    }
+
+    pub fn has_failures(&self) -> bool {
+        !self.failures.is_empty()
+    }
+}
+
+impl BatchCallResult {
+    pub fn new(env: &Env) -> Self {
+        Self {
+            successes: Vec::new(env),
+            failures: Vec::new(env),
+        }
+    }
+
+    pub fn record_success(&mut self, index: u32, value: CallResult) {
+        self.successes.push_back(BatchCallSuccess {
+            index,
+            result: value,
+        });
+    }
+
+    pub fn record_failure(&mut self, env: &Env, index: u32, message: &str) {
+        self.failures.push_back(BatchFailure {
+            index,
+            message: String::from_str(env, message),
+        });
+    }
+
+    pub fn has_failures(&self) -> bool {
+        !self.failures.is_empty()
+    }
+}
+
 /// Checks that `caller` matches the admin address stored under `key`.
 ///
 /// Expands to an expression that returns `Err($not_init_err)` if the key is
