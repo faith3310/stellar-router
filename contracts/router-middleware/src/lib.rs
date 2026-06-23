@@ -116,10 +116,13 @@ pub struct CallLogEntry {
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct CallLogState {
-    /// Fixed-capacity call entries retained for the route
+    /// Fixed-capacity call entries retained for the route.
+    /// Pre-allocated in `configure_route` to `log_retention` with placeholder entries.
     pub entries: Vec<CallLogEntry>,
     /// Index of the oldest entry in `entries` (0 when not wrapped)
     pub head: u32,
+    /// Total real entries written so far, capped at entries.len()
+    pub count: u32,
 }
 
 /// Aggregated summary for a route's call log.
@@ -243,6 +246,38 @@ impl RouterMiddleware {
             env.storage()
                 .instance()
                 .set(&DataKey::ConfiguredRoutes, &configured);
+        }
+
+        // Pre-allocate the call log ring buffer or clear it if retention is disabled
+        if log_retention > 0 {
+            // Remove old state from a prior reconfiguration so the new size takes effect
+            env.storage()
+                .instance()
+                .remove(&DataKey::CallLog(route.clone()));
+
+            let placeholder = CallLogEntry {
+                caller: caller.clone(),
+                timestamp: 0,
+                success: false,
+                route: route.clone(),
+            };
+            let mut entries = Vec::new(&env);
+            for _ in 0..log_retention {
+                entries.push_back(placeholder.clone());
+            }
+            let log = CallLogState {
+                entries,
+                head: 0,
+                count: 0,
+            };
+            env.storage()
+                .instance()
+                .set(&DataKey::CallLog(route.clone()), &log);
+        } else {
+            // Logging disabled — clear any prior ring buffer to free storage
+            env.storage()
+                .instance()
+                .remove(&DataKey::CallLog(route.clone()));
         }
 
         Ok(())
@@ -472,6 +507,7 @@ impl RouterMiddleware {
                     .unwrap_or(CallLogState {
                         entries: Vec::new(&env),
                         head: 0,
+                        count: 0,
                     });
 
                 let entry = CallLogEntry {
@@ -482,13 +518,16 @@ impl RouterMiddleware {
                 };
 
                 let cap = config.log_retention;
-                if log.entries.len() < cap {
+                let len = log.entries.len();
+                if len < cap {
+                    // Growth phase: only hit for routes configured before the
+                    // pre-allocation upgrade that haven't been re-configured yet.
                     log.entries.push_back(entry);
-                } else if cap > 0 {
-                    // Overwrite oldest slot and advance head (fixed-size ring buffer)
+                } else {
                     log.entries.set(log.head, entry);
                     log.head = (log.head + 1) % cap;
                 }
+                log.count = log.count.saturating_add(1).min(cap);
 
                 env.storage()
                     .instance()
@@ -675,16 +714,29 @@ impl RouterMiddleware {
             return Vec::new(&env);
         };
 
-        if log_state.entries.is_empty() || log_state.head == 0 {
-            return log_state.entries;
+        let count = log_state.count;
+        if count == 0 {
+            return Vec::new(&env);
         }
 
-        let len = log_state.entries.len();
+        let cap = log_state.entries.len();
+        if cap == 0 {
+            return Vec::new(&env);
+        }
+
         let mut ordered = Vec::new(&env);
-        for i in 0..len {
-            let idx = (log_state.head + i) % len;
-            if let Some(entry) = log_state.entries.get(idx) {
-                ordered.push_back(entry);
+        if count < cap {
+            for i in 0..count {
+                if let Some(entry) = log_state.entries.get(i) {
+                    ordered.push_back(entry);
+                }
+            }
+        } else {
+            for i in 0..cap {
+                let idx = (log_state.head + i) % cap;
+                if let Some(entry) = log_state.entries.get(idx) {
+                    ordered.push_back(entry);
+                }
             }
         }
         ordered
@@ -712,15 +764,19 @@ impl RouterMiddleware {
             return Vec::new(&env);
         };
 
-        if log_state.entries.is_empty() {
+        let count = log_state.count;
+        if count == 0 {
             return Vec::new(&env);
         }
 
-        let len = log_state.entries.len();
-        let mut ordered = Vec::new(&env);
+        let cap = log_state.entries.len();
+        if cap == 0 {
+            return Vec::new(&env);
+        }
 
-        if log_state.head == 0 {
-            for i in 0..len {
+        let mut ordered = Vec::new(&env);
+        if count < cap {
+            for i in 0..count {
                 if let Some(entry) = log_state.entries.get(i) {
                     if entry.success == success_only {
                         ordered.push_back(entry);
@@ -728,8 +784,8 @@ impl RouterMiddleware {
                 }
             }
         } else {
-            for i in 0..len {
-                let idx = (log_state.head + i) % len;
+            for i in 0..cap {
+                let idx = (log_state.head + i) % cap;
                 if let Some(entry) = log_state.entries.get(idx) {
                     if entry.success == success_only {
                         ordered.push_back(entry);
@@ -759,7 +815,7 @@ impl RouterMiddleware {
         env.storage()
             .instance()
             .get::<DataKey, CallLogState>(&DataKey::CallLog(route))
-            .map(|log| log.entries.len())
+            .map(|log| log.count)
             .unwrap_or(0)
     }
 
@@ -804,7 +860,42 @@ impl RouterMiddleware {
     ) -> Result<(), MiddlewareError> {
         caller.require_auth();
         router_common::require_admin_simple!(&env, &caller, &DataKey::Admin, MiddlewareError)?;
-        env.storage().instance().remove(&DataKey::CallLog(route.clone()));
+
+        // Re-create pre-allocated ring buffer or clear entirely
+        if let Some(config) = env
+            .storage()
+            .instance()
+            .get::<DataKey, RouteConfig>(&DataKey::RouteConfig(route.clone()))
+        {
+            if config.log_retention > 0 {
+                let placeholder = CallLogEntry {
+                    caller: caller.clone(),
+                    timestamp: 0,
+                    success: false,
+                    route: route.clone(),
+                };
+                let mut entries = Vec::new(&env);
+                for _ in 0..config.log_retention {
+                    entries.push_back(placeholder.clone());
+                }
+                let log = CallLogState {
+                    entries,
+                    head: 0,
+                    count: 0,
+                };
+                env.storage()
+                    .instance()
+                    .set(&DataKey::CallLog(route.clone()), &log);
+            } else {
+                env.storage()
+                    .instance()
+                    .remove(&DataKey::CallLog(route.clone()));
+            }
+        } else {
+            env.storage()
+                .instance()
+                .remove(&DataKey::CallLog(route.clone()));
+        }
         env.events().publish(
             (Symbol::new(&env, "call_log_cleared"),),
             route,
@@ -1386,7 +1477,7 @@ mod tests {
 
     #[test]
     fn test_admin_getter() {
-        let (env, admin, client) = setup();
+        let (_env, admin, client) = setup();
         let retrieved_admin = client.admin();
         assert_eq!(retrieved_admin, admin);
     }
