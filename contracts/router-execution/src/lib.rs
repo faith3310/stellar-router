@@ -145,6 +145,30 @@ pub struct FeeEstimate {
     pub high_load: bool,
 }
 
+// ── Fee estimation constants ──────────────────────────────────────────────────
+
+/// Minimum base fee in stroops (Stellar network minimum transaction fee).
+const BASE_FEE_STROOPS: i128 = 100;
+
+/// Scaling divisor for resource fee: amount / FEE_SCALE_DIVISOR gives the
+/// proportional resource fee (0.1% of amount).
+const FEE_SCALE_DIVISOR: i128 = 1000;
+
+/// Minimum resource fee in stroops; applies when the scaled amount is below
+/// this floor.
+const MIN_RESOURCE_FEE_STROOPS: i128 = 100;
+
+/// Network utilization basis-point threshold above which surge (2×) pricing
+/// is applied (8000 bps = 80%).
+const HIGH_LOAD_THRESHOLD_BPS: u32 = 8000;
+
+/// Surge pricing multiplier applied when the network is under high load
+/// (stored as a percentage: 200 = 2×).
+const SURGE_MULTIPLIER: u32 = 200;
+
+/// Normal (no-surge) pricing multiplier (100 = 1×).
+const NORMAL_MULTIPLIER: u32 = 100;
+
 // ── Contract ──────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -370,20 +394,20 @@ impl RouterExecution {
             return Err(ExecutionError::InvalidAmount);
         }
 
-        // Base fee: 100 stroops minimum (Stellar network minimum)
-        let base_fee: i128 = 100;
+        // Base fee: minimum Stellar network transaction fee
+        let base_fee: i128 = BASE_FEE_STROOPS;
 
-        // Resource fee scales with amount (0.1% of amount, min 100 stroops)
+        // Resource fee scales with amount (0.1% of amount, min MIN_RESOURCE_FEE_STROOPS)
         let resource_fee: i128 = {
-            let scaled = amount / 1000;
-            if scaled < 100 { 100 } else { scaled }
+            let scaled = amount / FEE_SCALE_DIVISOR;
+            if scaled < MIN_RESOURCE_FEE_STROOPS { MIN_RESOURCE_FEE_STROOPS } else { scaled }
         };
 
-        // Surge pricing: if high_load_threshold >= 8000 bps (80%), apply 2x multiplier
-        let (surge_multiplier, high_load) = if high_load_threshold >= 8000 {
-            (200u32, true)
+        // Surge pricing: apply 2x multiplier above HIGH_LOAD_THRESHOLD_BPS
+        let (surge_multiplier, high_load) = if high_load_threshold >= HIGH_LOAD_THRESHOLD_BPS {
+            (SURGE_MULTIPLIER, true)
         } else {
-            (100u32, false)
+            (NORMAL_MULTIPLIER, false)
         };
 
         let total_fee = (base_fee + resource_fee) * surge_multiplier as i128 / 100;
