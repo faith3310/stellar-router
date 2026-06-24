@@ -14,7 +14,7 @@
 extern crate alloc;
 use alloc::string::ToString;
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Val, Vec,
 };
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -71,6 +71,7 @@ pub enum RegistryError {
     VersionNotFound = 8,
     InvalidConstraint = 9,
     AllVersionsDeprecated = 10,
+    ContractUnreachable = 11,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -133,6 +134,38 @@ impl RouterRegistry {
     ) -> Result<(), RegistryError> {
         caller.require_auth();
         Self::require_admin(&env, &caller)?;
+        Self::register_entry(&env, &caller, name, address, version)
+    }
+
+    /// Register a new contract entry with an optional liveness check.
+    ///
+    /// When `health_fn` is provided, the registry invokes that function on
+    /// `address` via a cross-contract call before storing the entry. If the
+    /// call fails, registration is rejected with
+    /// [`RegistryError::ContractUnreachable`].
+    ///
+    /// When `health_fn` is `None`, this behaves identically to [`register`].
+    pub fn register_with_check(
+        env: Env,
+        caller: Address,
+        name: String,
+        version: u32,
+        address: Address,
+        health_fn: Option<Symbol>,
+    ) -> Result<(), RegistryError> {
+        caller.require_auth();
+        Self::require_admin(&env, &caller)?;
+
+        if let Some(fn_sym) = health_fn {
+            let args: Vec<Val> = Vec::new(&env);
+            if env
+                .try_invoke_contract::<Val, Val>(&address, &fn_sym, args)
+                .is_err()
+            {
+                return Err(RegistryError::ContractUnreachable);
+            }
+        }
+
         Self::register_entry(&env, &caller, name, address, version)
     }
 
@@ -549,6 +582,7 @@ impl RouterRegistry {
             RegistryError::VersionNotFound => "VersionNotFound",
             RegistryError::InvalidConstraint => "InvalidConstraint",
             RegistryError::AllVersionsDeprecated => "AllVersionsDeprecated",
+            RegistryError::ContractUnreachable => "ContractUnreachable",
         }
     }
 
@@ -1407,5 +1441,53 @@ mod tests {
         let entry = client.get(&name, &1);
         assert!(entry.deprecated);
         assert_eq!(entry.deprecation_reason, None);
+    }
+
+    // ── register_with_check ───────────────────────────────────────────────────
+
+    #[contract]
+    pub struct MockHealthContract;
+
+    #[contractimpl]
+    impl MockHealthContract {
+        pub fn version(_env: Env) -> u32 {
+            1
+        }
+
+        pub fn health(_env: Env) {}
+    }
+
+    #[test]
+    fn test_register_with_check_no_health_fn_succeeds() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let addr = Address::generate(&env);
+        let result = client.try_register_with_check(&admin, &name, &1, &addr, &None::<Symbol>);
+        assert_eq!(result, Ok(Ok(())));
+        let entry = client.get(&name, &1);
+        assert_eq!(entry.address, addr);
+    }
+
+    #[test]
+    fn test_register_with_check_health_fn_succeeds() {
+        let (env, admin, client) = setup();
+        let mock_id = env.register_contract(None, MockHealthContract);
+        let name = String::from_str(&env, "oracle");
+        let health_fn = Symbol::new(&env, "version");
+        let result = client.try_register_with_check(&admin, &name, &1, &mock_id, &Some(health_fn));
+        assert_eq!(result, Ok(Ok(())));
+        let entry = client.get(&name, &1);
+        assert_eq!(entry.address, mock_id);
+    }
+
+    #[test]
+    fn test_register_with_check_missing_health_fn_fails() {
+        let (env, admin, client) = setup();
+        let mock_id = env.register_contract(None, MockHealthContract);
+        let name = String::from_str(&env, "oracle");
+        let health_fn = Symbol::new(&env, "nonexistent");
+        let result = client.try_register_with_check(&admin, &name, &1, &mock_id, &Some(health_fn));
+        assert_eq!(result, Err(Ok(RegistryError::ContractUnreachable)));
+        assert_eq!(client.try_get(&name, &1), Err(Ok(RegistryError::NotFound)));
     }
 }

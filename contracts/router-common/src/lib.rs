@@ -117,6 +117,9 @@ pub const EVENT_CALL_LOG_CLEARED: &str = "call_log_cleared";
 /// Standard event topic for multicall results
 pub const EVENT_CALL_RESULT: &str = "call_result";
 
+/// Standard event topic for a required call failure in multicall (includes index + contract context)
+pub const EVENT_CALL_FAILED: &str = "call_failed";
+
 /// Standard event topic for max batch size updates
 pub const EVENT_MAX_BATCH_SIZE_UPDATED: &str = "max_batch_size_updated";
 

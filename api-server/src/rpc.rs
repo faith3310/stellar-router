@@ -2,6 +2,7 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tracing::warn;
 
 use crate::types::{RouteEntryResponse, RouteMetadataResponse};
 
@@ -62,6 +63,7 @@ pub struct FeeBreakdown {
     pub surge_multiplier: u32,
     pub high_load: bool,
     pub would_succeed: bool,
+    pub fee_estimated: bool,
 }
 
 impl SorobanRpcClient {
@@ -83,7 +85,16 @@ impl SorobanRpcClient {
         match self.call_simulate_rpc(target, function).await {
             Ok(result) => {
                 let would_succeed = result.error.is_none();
-                let resource_fee: i64 = result.min_resource_fee.parse().unwrap_or(1_000);
+                let (resource_fee, fee_estimated) = match result.min_resource_fee.parse::<i64>() {
+                    Ok(v) => (v, true),
+                    Err(_) => {
+                        warn!(
+                            raw = %result.min_resource_fee,
+                            "failed to parse min_resource_fee from RPC response; using fallback 1000 stroops"
+                        );
+                        (1_000, false)
+                    }
+                };
                 let base_fee: i64 = 100;
                 let (surge_multiplier, high_load) = if network_load_bps >= 8_000 {
                     (200u32, true)
@@ -98,6 +109,7 @@ impl SorobanRpcClient {
                     surge_multiplier,
                     high_load,
                     would_succeed,
+                    fee_estimated,
                 })
             }
             Err(_) => Ok(Self::heuristic_estimate(amount, network_load_bps)),
@@ -321,6 +333,7 @@ impl SorobanRpcClient {
             surge_multiplier,
             high_load,
             would_succeed: true,
+            fee_estimated: false,
         }
     }
 }

@@ -24,6 +24,7 @@ pub enum DataKey {
     RouteFee(String),
     /// Default fee if route-specific fee not set (in basis points)
     DefaultFee,
+    ConfiguredRoutes
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -154,6 +155,14 @@ impl RouterQuote {
             return Err(QuoteError::InvalidFeeBps);
         }
 
+
+        // Maintain route index — only append if not already tracked
+        let mut routes = Self::read_configured_routes(&env);
+        if !routes.contains(&route) {
+            routes.push_back(route.clone());
+            Self::write_configured_routes(&env, &routes);
+        }
+
         env.storage()
             .instance()
             .set(&DataKey::RouteFee(route.clone()), &fee_bps);
@@ -187,6 +196,27 @@ impl RouterQuote {
                     .unwrap_or(100) // Default to 1% if not initialized
             })
     }
+
+    /// Get all configured router fee.
+    ///
+    /// Returns a vector of route_name and fee_bps.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    ///
+    /// # Returns
+    /// Router name and Fee in basis points.
+    pub fn get_all_configured_routes(env: Env) -> Vec<(String, u32)> {
+        let routes = Self::read_configured_routes(&env);
+        let mut configures_routes = Vec::new(&env);
+
+        for route in routes {
+            let fee = Self::get_route_fee(env.clone(), route.clone());
+            configures_routes.push_back((route, fee));
+        }
+        configures_routes
+    }
+
 
     /// Get a quote for a single route with configurable fee.
     ///
@@ -407,6 +437,19 @@ impl RouterQuote {
             return Err(QuoteError::Unauthorized);
         }
         Ok(())
+    }
+
+    fn read_configured_routes(env: &Env) -> Vec<String> {
+        env.storage()
+            .instance()
+            .get(&DataKey::ConfiguredRoutes)
+            .unwrap_or_else(|| Vec::new(env))
+    }
+
+    fn write_configured_routes(env: &Env, routes: &Vec<String>) {
+        env.storage()
+            .instance()
+            .set(&DataKey::ConfiguredRoutes, routes);
     }
 }
 
@@ -780,5 +823,29 @@ mod tests {
     fn test_admin_getter() {
         let (env, admin, client) = setup();
         assert_eq!(client.admin(), admin);
+    }
+
+    #[test]
+    fn test_get_all_configured_routes() {
+        let (env, admin, client) = setup();
+        let uniswap = String::from_str(&env, "uniswap");
+        client.set_route_fee(&admin, &uniswap, &50); // 0.5%
+        let sushiswap = String::from_str(&env, "sushiswap");
+        client.set_route_fee(&admin, &sushiswap, &10); // 0.1%
+        let balancer = String::from_str(&env, "balancer");
+        client.set_route_fee(&admin, &balancer, &40); // 0.4%
+        let aerodrome = String::from_str(&env, "aerodrome");
+        client.set_route_fee(&admin, &aerodrome, &50); // 0.5%
+
+        let all_configured_routes = client.get_all_configured_routes();
+        assert_eq!(all_configured_routes.len(), 4);
+        assert_eq!(all_configured_routes.get(0).unwrap().0, String::from_str(&env, "uniswap"));
+        assert_eq!(all_configured_routes.get(0).unwrap().1, 50);
+         assert_eq!(all_configured_routes.get(1).unwrap().0, String::from_str(&env, "sushiswap"));
+        assert_eq!(all_configured_routes.get(1).unwrap().1, 10);
+         assert_eq!(all_configured_routes.get(2).unwrap().0, String::from_str(&env, "balancer"));
+        assert_eq!(all_configured_routes.get(2).unwrap().1, 40);
+         assert_eq!(all_configured_routes.get(3).unwrap().0, String::from_str(&env, "aerodrome"));
+        assert_eq!(all_configured_routes.get(3).unwrap().1, 50);
     }
 }

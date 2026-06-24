@@ -60,6 +60,7 @@ pub async fn simulate(
             total_fee: breakdown.total_fee,
             surge_multiplier: breakdown.surge_multiplier,
             high_load: breakdown.high_load,
+            fee_estimated: breakdown.fee_estimated,
         },
         simulation: SimulationDetail {
             target: req.target,

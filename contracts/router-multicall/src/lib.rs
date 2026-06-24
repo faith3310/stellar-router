@@ -239,11 +239,15 @@ impl RouterMulticall {
 
             env.events().publish(
                 (Symbol::new(&env, "call_result"),),
-                (&caller, &call.target, &call.function, success),
+                (&caller, &call.target, &call.function, success, call_index),
             );
 
             if !success {
                 if call.required {
+                    env.events().publish(
+                        (Symbol::new(&env, "call_failed"),),
+                        (call_index, &call.target, &call.function),
+                    );
                     env.storage().instance().remove(&DataKey::Executing);
                     return Err(MulticallError::RequiredCallFailed);
                 }
@@ -789,7 +793,7 @@ mod tests {
     }
 
     #[test]
-    fn test_call_result_event_includes_caller() {
+    fn test_call_result_event_includes_caller_and_index() {
             let (env, _admin, client) = setup();
             let mock_id = env.register_contract(None, MockContract);
             let caller = Address::generate(&env);
@@ -805,7 +809,6 @@ mod tests {
 
             client.execute_batch(&caller, &calls, &false, &false, &false);
 
-            // Find the call_result event — tuple is (contract_id, topics: Vec<Val>, data: Val)
             let all_events = env.events().all();
             let (_, _, data) = all_events
                 .iter()
@@ -817,12 +820,61 @@ mod tests {
                 })
                 .expect("call_result event not found");
 
-            // Data is a Vec<Val>; decode first element as Address and assert it equals caller
             let data_vec = soroban_sdk::Vec::<soroban_sdk::Val>::from_val(&env, &data);
             let event_caller = Address::from_val(&env, &data_vec.get(0).unwrap());
+            let event_index = u32::from_val(&env, &data_vec.get(4).unwrap());
 
             assert_eq!(event_caller, caller);
+            assert_eq!(event_index, 0u32);
         }
+
+    #[test]
+    fn test_call_failed_event_emitted_with_index_and_contract() {
+        let (env, _admin, client) = setup();
+        let mock_id = env.register_contract(None, MockContract);
+        let caller = Address::generate(&env);
+
+        let mut calls = Vec::new(&env);
+        // index 0: optional success
+        calls.push_back(CallDescriptor {
+            target: mock_id.clone(),
+            function: Symbol::new(&env, "success"),
+            required: false,
+            instruction_budget: None,
+            args: Vec::new(&env),
+        });
+        // index 1: required failure — should emit call_failed
+        calls.push_back(CallDescriptor {
+            target: mock_id.clone(),
+            function: Symbol::new(&env, "fail"),
+            required: true,
+            instruction_budget: None,
+            args: Vec::new(&env),
+        });
+
+        let result = client.try_execute_batch(&caller, &calls, &false, &false, &false);
+        assert_eq!(result, Err(Ok(MulticallError::RequiredCallFailed)));
+
+        let all_events = env.events().all();
+        let (_, _, data) = all_events
+            .iter()
+            .find(|(_, topics, _)| {
+                topics
+                    .get(0)
+                    .map(|v| Symbol::from_val(&env, &v) == Symbol::new(&env, "call_failed"))
+                    .unwrap_or(false)
+            })
+            .expect("call_failed event not found");
+
+        let data_vec = soroban_sdk::Vec::<soroban_sdk::Val>::from_val(&env, &data);
+        let event_index = u32::from_val(&env, &data_vec.get(0).unwrap());
+        let event_contract = Address::from_val(&env, &data_vec.get(1).unwrap());
+        let event_function = Symbol::from_val(&env, &data_vec.get(2).unwrap());
+
+        assert_eq!(event_index, 1u32);
+        assert_eq!(event_contract, mock_id);
+        assert_eq!(event_function, Symbol::new(&env, "fail"));
+    }
 
     #[test]
     fn test_total_batches_not_incremented_when_required_call_fails() {
@@ -895,5 +947,251 @@ mod tests {
         });
         let result = client.try_execute_batch(&caller, &ok_calls, &false, &false, &false);
         assert!(result.is_ok());
+    }
+
+    // ── Issue #587: mixed required/optional failure scenarios ─────────────────
+
+    /// 1. First call optional + fails, second required + succeeds
+    /// Batch should succeed with partial results.
+    #[test]
+    fn test_first_optional_fails_second_required_succeeds() {
+        let (env, _admin, client) = setup();
+        let mock_id = env.register_contract(None, MockContract);
+        let caller = Address::generate(&env);
+
+        let mut calls = Vec::new(&env);
+        // First: optional, fails
+        calls.push_back(CallDescriptor {
+            target: mock_id.clone(),
+            function: Symbol::new(&env, "fail"),
+            required: false,
+            instruction_budget: None,
+            args: Vec::new(&env),
+        });
+        // Second: required, succeeds
+        calls.push_back(CallDescriptor {
+            target: mock_id.clone(),
+            function: Symbol::new(&env, "success"),
+            required: true,
+            instruction_budget: None,
+            args: Vec::new(&env),
+        });
+
+        let summary = client
+            .execute_batch(&caller, &calls, &false, &false, &false);
+        let (total, succeeded, failed) = batch_counts(&summary);
+        assert_eq!(total, 2);
+        assert_eq!(succeeded, 1);
+        assert_eq!(failed, 1);
+        assert_eq!(client.total_batches(), 1);
+    }
+
+    /// 2. Multiple optional calls all fail — batch should succeed with zero
+    ///    successful calls.
+    #[test]
+    fn test_multiple_optional_calls_all_fail() {
+        let (env, _admin, client) = setup();
+        let mock_id = env.register_contract(None, MockContract);
+        let caller = Address::generate(&env);
+
+        let mut calls = Vec::new(&env);
+        for _ in 0..3 {
+            calls.push_back(CallDescriptor {
+                target: mock_id.clone(),
+                function: Symbol::new(&env, "fail"),
+                required: false,
+                instruction_budget: None,
+                args: Vec::new(&env),
+            });
+        }
+
+        let summary = client
+            .execute_batch(&caller, &calls, &false, &false, &false);
+        let (total, succeeded, failed) = batch_counts(&summary);
+        assert_eq!(total, 3);
+        assert_eq!(succeeded, 0);
+        assert_eq!(failed, 3);
+        assert_eq!(client.total_batches(), 1);
+    }
+
+    /// 3. Required call fails after several optional successes.
+    ///    Verify the batch aborts with an error and the total_batches counter
+    ///    is not incremented. The on-chain behaviour is that all state changes
+    ///    (including store_results writes) are rolled back when the invocation
+    ///    returns an error.
+    #[test]
+    fn test_required_fails_after_optional_successes_aborts_batch() {
+        let (env, _admin, client) = setup();
+        let mock_id = env.register_contract(None, MockContract);
+        let caller = Address::generate(&env);
+
+        let mut calls = Vec::new(&env);
+        // Call 0: optional + success
+        calls.push_back(CallDescriptor {
+            target: mock_id.clone(),
+            function: Symbol::new(&env, "success"),
+            required: false,
+            instruction_budget: None,
+            args: Vec::new(&env),
+        });
+        // Call 1: optional + success
+        calls.push_back(CallDescriptor {
+            target: mock_id.clone(),
+            function: Symbol::new(&env, "success"),
+            required: false,
+            instruction_budget: None,
+            args: Vec::new(&env),
+        });
+        // Call 2: required + fail → should abort
+        calls.push_back(CallDescriptor {
+            target: mock_id.clone(),
+            function: Symbol::new(&env, "fail"),
+            required: true,
+            instruction_budget: None,
+            args: Vec::new(&env),
+        });
+
+        let result =
+            client.try_execute_batch(&caller, &calls, &false, &false, &false);
+        assert_eq!(result, Err(Ok(MulticallError::RequiredCallFailed)));
+
+        // Total batches should NOT be incremented on failure
+        assert_eq!(client.total_batches(), 0);
+
+        // Verify reentrancy guard is cleared — subsequent call should succeed
+        let mut ok_calls = Vec::new(&env);
+        ok_calls.push_back(CallDescriptor {
+            target: mock_id.clone(),
+            function: Symbol::new(&env, "success"),
+            required: true,
+            instruction_budget: None,
+            args: Vec::new(&env),
+        });
+        let second_result =
+            client.try_execute_batch(&caller, &ok_calls, &false, &false, &false);
+        assert!(second_result.is_ok());
+    }
+
+    /// 4. All calls optional, all fail — verify BatchCallResult has correct
+    ///    success_count: 0 and failure_count: N.
+    #[test]
+    fn test_all_optional_all_fail_zero_success_count() {
+        let (env, _admin, client) = setup();
+        let mock_id = env.register_contract(None, MockContract);
+        let caller = Address::generate(&env);
+
+        let mut calls = Vec::new(&env);
+        calls.push_back(CallDescriptor {
+            target: mock_id.clone(),
+            function: Symbol::new(&env, "fail"),
+            required: false,
+            instruction_budget: None,
+            args: Vec::new(&env),
+        });
+        calls.push_back(CallDescriptor {
+            target: mock_id.clone(),
+            function: Symbol::new(&env, "fail"),
+            required: false,
+            instruction_budget: None,
+            args: Vec::new(&env),
+        });
+
+        let summary = client
+            .execute_batch(&caller, &calls, &false, &false, &false);
+        let (total, succeeded, failed) = batch_counts(&summary);
+        assert_eq!(total, 2);
+        assert_eq!(succeeded, 0);
+        assert_eq!(failed, 2);
+        // Batch counter still increments — the batch "completed" (all optional
+        // failures don't abort the batch)
+        assert_eq!(client.total_batches(), 1);
+    }
+
+    /// 5. Alternating required/optional with failures — verify execution stops
+    ///    at first required failure. Since state is rolled back on error, the
+    ///    optional failures before the abort are not persisted.
+    #[test]
+    fn test_alternating_required_optional_stops_at_first_required_failure() {
+        let (env, _admin, client) = setup();
+        let mock_id = env.register_contract(None, MockContract);
+        let caller = Address::generate(&env);
+
+        let mut calls = Vec::new(&env);
+        // Call 0: optional + fail → continues (failure recorded in-memory)
+        calls.push_back(CallDescriptor {
+            target: mock_id.clone(),
+            function: Symbol::new(&env, "fail"),
+            required: false,
+            instruction_budget: None,
+            args: Vec::new(&env),
+        });
+        // Call 1: required + success → continues
+        calls.push_back(CallDescriptor {
+            target: mock_id.clone(),
+            function: Symbol::new(&env, "success"),
+            required: true,
+            instruction_budget: None,
+            args: Vec::new(&env),
+        });
+        // Call 2: optional + fail → continues (failure recorded in-memory)
+        calls.push_back(CallDescriptor {
+            target: mock_id.clone(),
+            function: Symbol::new(&env, "fail"),
+            required: false,
+            instruction_budget: None,
+            args: Vec::new(&env),
+        });
+        // Call 3: required + fail → batch aborts here
+        calls.push_back(CallDescriptor {
+            target: mock_id.clone(),
+            function: Symbol::new(&env, "fail"),
+            required: true,
+            instruction_budget: None,
+            args: Vec::new(&env),
+        });
+        // Call 4: should never be reached
+        calls.push_back(CallDescriptor {
+            target: mock_id.clone(),
+            function: Symbol::new(&env, "success"),
+            required: false,
+            instruction_budget: None,
+            args: Vec::new(&env),
+        });
+
+        let result =
+            client.try_execute_batch(&caller, &calls, &false, &false, &false);
+        assert_eq!(result, Err(Ok(MulticallError::RequiredCallFailed)));
+        assert_eq!(client.total_batches(), 0);
+
+        // Verify that calls after the first required failure (index 4) were
+        // never executed — the batch stopped at index 3. We can verify this
+        // by checking that only 4 call_result events were emitted (indices 0-3).
+        // The first required failure triggers an immediate abort.
+        let all_events = env.events().all();
+        let call_result_count = all_events
+            .iter()
+            .filter(|(_, topics, _)| {
+                topics
+                    .get(0)
+                    .map(|v| {
+                        Symbol::from_val(&env, &v) == Symbol::new(&env, "call_result")
+                    })
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(call_result_count, 4, "only calls 0-3 should have executed");
+
+        // Verify reentrancy guard is cleared after failure
+        let mut ok_calls = Vec::new(&env);
+        ok_calls.push_back(CallDescriptor {
+            target: mock_id.clone(),
+            function: Symbol::new(&env, "success"),
+            required: true,
+            instruction_budget: None,
+            args: Vec::new(&env),
+        });
+        let second_result =
+            client.try_execute_batch(&caller, &ok_calls, &false, &false, &false);
+        assert!(second_result.is_ok());
     }
 }

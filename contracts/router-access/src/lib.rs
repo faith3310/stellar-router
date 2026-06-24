@@ -19,6 +19,7 @@ pub enum DataKey {
     RoleMembers(String),   // role -> Vec<Address>
     AddressRoles(Address), // address -> Vec<String>
     RoleExpiry(String, Address),
+    AllRoles, // Vec<String> — all roles ever defined in the system
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -192,6 +193,8 @@ impl RouterAccess {
         if Self::is_blacklisted_internal(&env, &admin) {
             return Err(AccessError::Blacklisted);
         }
+        // Track this role in AllRoles if it's the first time we've seen it
+        Self::track_role_in_all_roles(&env, &role);
         env.storage()
             .instance()
             .set(&DataKey::RoleAdmin(role.clone()), &admin);
@@ -205,6 +208,26 @@ impl RouterAccess {
         env.storage()
             .instance()
             .get::<DataKey, Address>(&DataKey::RoleAdmin(role))
+    }
+
+    /// List all roles that have ever been defined in the system.
+    ///
+    /// This is the roles equivalent of `router-core`'s `get_all_routes()`.
+    /// Returns all role names that have been tracked via `grant_role()` or
+    /// `set_role_admin()`. Roles are never removed from this list even if all
+    /// members are revoked — this preserves an audit trail of all roles that
+    /// have existed.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    ///
+    /// # Returns
+    /// A [`Vec<String>`] of all role names in the system.
+    pub fn list_all_roles(env: Env) -> Vec<String> {
+        env.storage()
+            .instance()
+            .get(&DataKey::AllRoles)
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Blacklist an address.
@@ -321,6 +344,21 @@ impl RouterAccess {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    /// Track a role name in the AllRoles list if it hasn't been seen before.
+    fn track_role_in_all_roles(env: &Env, role: &String) {
+        let mut all_roles: Vec<String> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllRoles)
+            .unwrap_or_else(|| Vec::new(env));
+        if !all_roles.iter().any(|r| r == *role) {
+            all_roles.push_back(role.clone());
+            env.storage()
+                .instance()
+                .set(&DataKey::AllRoles, &all_roles);
+        }
+    }
+
     fn access_error_message(err: AccessError) -> &'static str {
         match err {
             AccessError::AlreadyInitialized => "AlreadyInitialized",
@@ -345,6 +383,9 @@ impl RouterAccess {
         if Self::has_role_internal(env, account, role) {
             return Err(AccessError::AlreadyHasRole);
         }
+
+        // Track this role in AllRoles if it's the first time we've seen it
+        Self::track_role_in_all_roles(env, role);
 
         let expiry_timestamp = match expires_in {
             Some(seconds) => env.ledger().timestamp() + seconds,
@@ -1005,5 +1046,75 @@ mod tests {
         assert_eq!(result.successes.len(), 0);
         assert_eq!(result.failures.len(), 1);
         assert!(!client.has_role(&u2, &role));
+    }
+
+    // ── Issue #578: list_all_roles ────────────────────────────────────────────
+
+    #[test]
+    fn test_list_all_roles_empty_initially() {
+        let (env, _admin, client) = setup();
+        let roles = client.list_all_roles();
+        assert!(roles.is_empty());
+    }
+
+    #[test]
+    fn test_list_all_roles_tracks_roles_from_grant() {
+        let (env, admin, client) = setup();
+        let role1 = String::from_str(&env, "operator");
+        let role2 = String::from_str(&env, "editor");
+        let user = Address::generate(&env);
+
+        client.grant_role(&admin, &user, &role1, &None);
+        let roles_after_first = client.list_all_roles();
+        assert_eq!(roles_after_first.len(), 1);
+        assert!(roles_after_first.contains(&role1));
+
+        client.grant_role(&admin, &user, &role2, &None);
+        let roles_after_second = client.list_all_roles();
+        assert_eq!(roles_after_second.len(), 2);
+        assert!(roles_after_second.contains(&role1));
+        assert!(roles_after_second.contains(&role2));
+    }
+
+    #[test]
+    fn test_list_all_roles_tracks_roles_from_set_role_admin() {
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "viewer");
+        let role_admin = Address::generate(&env);
+
+        // set_role_admin with a brand-new role should track it
+        client.set_role_admin(&admin, &role, &role_admin);
+        let roles = client.list_all_roles();
+        assert!(roles.contains(&role));
+    }
+
+    #[test]
+    fn test_list_all_roles_deduplicates() {
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+
+        // Grant the same role to two different users — role should only appear once
+        client.grant_role(&admin, &user1, &role, &None);
+        client.grant_role(&admin, &user2, &role, &None);
+
+        let roles = client.list_all_roles();
+        assert_eq!(roles.len(), 1);
+        assert!(roles.contains(&role));
+    }
+
+    #[test]
+    fn test_list_all_roles_persists_after_revoke() {
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let user = Address::generate(&env);
+
+        client.grant_role(&admin, &user, &role, &None);
+        client.revoke_role(&admin, &role, &user);
+
+        // Role should still appear in list_all_roles even after all members are revoked
+        let roles = client.list_all_roles();
+        assert!(roles.contains(&role));
     }
 }

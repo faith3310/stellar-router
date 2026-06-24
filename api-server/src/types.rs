@@ -51,6 +51,7 @@ pub struct FeeEstimate {
     pub total_fee: i64,
     pub surge_multiplier: u32,
     pub high_load: bool,
+    pub fee_estimated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
