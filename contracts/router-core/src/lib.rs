@@ -48,12 +48,13 @@ pub enum DataKey {
     Aliases,          // Vec<String> of all alias names
     Score(String),    // name -> RouteScore
     Metadata(String), // name -> RouteMetadata (stored separately; avoids nested contracttype)
+    BestRoute,        // cached name of the highest-scoring non-paused route, if any
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 #[contracttype]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RouteMetadata {
     /// Human-readable description (max 256 chars)
     pub description: String,
@@ -81,7 +82,6 @@ pub struct RouteEntry {
 pub struct RouteRegisterInput {
     pub name: String,
     pub address: Address,
-    pub metadata: Option<RouteMetadata>,
 }
 
 
@@ -380,6 +380,9 @@ impl RouterCore {
         }
         env.storage().instance().set(&DataKey::Aliases, &updated_aliases);
 
+        // Removing a route may invalidate the cached best route; refresh it.
+        Self::recompute_best_route(&env);
+
         env.events()
             .publish((Symbol::new(&env, "route_removed"),), name.clone());
 
@@ -411,57 +414,65 @@ impl RouterCore {
         env: Env,
         caller: Address,
         routes: Vec<RouteRegisterInput>,
-    ) -> Result<(), RouterError> {
+        fail_fast: bool,
+    ) -> Result<router_common::BatchResult, RouterError> {
         caller.require_auth();
         router_common::require_admin_simple!(&env, &caller, &DataKey::Admin, RouterError)?;
 
-        // Validation phase: check all routes before writing any
-        let mut seen = Vec::new(&env);
-        for route in routes.iter() {
-            if seen.contains(&route.name) {
-                return Err(RouterError::RouteAlreadyExists);
-            }
-            Self::validate_route_name(&env, &route.name)?;
+        let mut result = router_common::BatchResult::new(&env);
 
-            // Validate metadata if provided
-            if let Some(ref meta) = route.metadata {
-                if meta.description.len() > 256 {
-                    return Err(RouterError::InvalidMetadata);
+        if fail_fast {
+            let mut seen = Vec::new(&env);
+            for (index, route) in routes.iter().enumerate() {
+                let idx = index as u32;
+                if seen.contains(&route.name) {
+                    result.record_failure(&env, idx, "RouteAlreadyExists");
+                    return Ok(result);
                 }
-                if meta.tags.len() > 5 {
-                    return Err(RouterError::InvalidMetadata);
+                if let Err(err) = Self::validate_route_name(&env, &route.name) {
+                    result.record_failure(&env, idx, Self::router_error_message(err));
+                    return Ok(result);
+                }
+                if env
+                    .storage()
+                    .instance()
+                    .has(&DataKey::Route(route.name.clone()))
+                {
+                    result.record_failure(&env, idx, "RouteAlreadyExists");
+                    return Ok(result);
+                }
+                seen.push_back(route.name.clone());
+            }
+
+            for (index, route) in routes.iter().enumerate() {
+                Self::register_route_internal(
+                    &env,
+                    &caller,
+                    route.name.clone(),
+                    route.address.clone(),
+                    None,
+                )?;
+                result.record_success(index as u32);
+            }
+        } else {
+            for (index, route) in routes.iter().enumerate() {
+                let idx = index as u32;
+                match Self::register_route_internal(
+                    &env,
+                    &caller,
+                    route.name.clone(),
+                    route.address.clone(),
+                    None,
+                ) {
+                    Ok(()) => result.record_success(idx),
+                    Err(err) => {
+                        result.record_failure(&env, idx, Self::router_error_message(err));
+                    }
                 }
             }
-            seen.push_back(route.name.clone());
         }
 
-        // Commit phase: write all routes
-        let mut route_names = Self::get_route_names(&env);
-        for route in routes.iter() {
-            let entry = RouteEntry {
-                address: route.address.clone(),
-                name: route.name.clone(),
-                paused: false,
-                updated_by: caller.clone(),
-                metadata: route.metadata.clone(),
-            };
-            env.storage()
-                .instance()
-                .set(&DataKey::Route(route.name.clone()), &entry);
-
-            route_names.push_back(route.name.clone());
-
-            env.events().publish(
-                (Symbol::new(&env, "route_registered"),),
-                (route.name.clone(), entry.address.clone()),
-            );
-        }
-
-        env.storage()
-            .instance()
-            .set(&DataKey::RouteNames, &route_names);
-
-        Ok(())
+        Ok(result)
     }
 
     /// Remove multiple routes in a single transaction.
@@ -486,54 +497,41 @@ impl RouterCore {
         env: Env,
         caller: Address,
         names: Vec<String>,
-    ) -> Result<(), RouterError> {
+        fail_fast: bool,
+    ) -> Result<router_common::BatchResult, RouterError> {
         caller.require_auth();
         router_common::require_admin_simple!(&env, &caller, &DataKey::Admin, RouterError)?;
 
-        // Validation phase: check all routes exist
-        for name in names.iter() {
-            if !env.storage().instance().has(&DataKey::Route(name.clone())) {
-                return Err(RouterError::RouteNotFound);
-            }
-        }
+        let mut result = router_common::BatchResult::new(&env);
 
-        // Commit phase: remove all routes
-        let route_names = Self::get_route_names(&env);
-        let mut updated_route_names = Vec::new(&env);
-        for route_name in route_names.iter() {
-            if !names.contains(&route_name) {
-                updated_route_names.push_back(route_name);
+        if fail_fast {
+            for (index, name) in names.iter().enumerate() {
+                let idx = index as u32;
+                if !env.storage().instance().has(&DataKey::Route(name.clone())) {
+                    result.record_failure(&env, idx, "RouteNotFound");
+                    return Ok(result);
+                }
             }
-        }
-        env.storage()
-            .instance()
-            .set(&DataKey::RouteNames, &updated_route_names);
 
-        // Clean up aliases pointing to removed routes
-        let aliases = Self::get_aliases(&env);
-        let mut updated_aliases = Vec::new(&env);
-        for alias in aliases.iter() {
-            if let Some(original_name) = env.storage().instance().get::<DataKey, String>(&DataKey::Alias(alias.clone())) {
-                if names.contains(&original_name) {
-                    // Remove this dangling alias
-                    env.storage().instance().remove(&DataKey::Alias(alias.clone()));
-                } else {
-                    // Keep this alias
-                    updated_aliases.push_back(alias);
+            for (index, name) in names.iter().enumerate() {
+                Self::remove_route_internal(&env, name.clone())?;
+                result.record_success(index as u32);
+            }
+        } else {
+            for (index, name) in names.iter().enumerate() {
+                let idx = index as u32;
+                match Self::remove_route_internal(&env, name.clone()) {
+                    Ok(()) => result.record_success(idx),
+                    Err(err) => {
+                        result.record_failure(&env, idx, Self::router_error_message(err));
+                    }
                 }
             }
         }
-        env.storage().instance().set(&DataKey::Aliases, &updated_aliases);
 
-        // Remove route entries and emit events
-        for name in names.iter() {
-            env.storage()
-                .instance()
-                .remove(&DataKey::Route(name.clone()));
-
-            env.events()
-                .publish((Symbol::new(&env, "route_removed"),), name.clone());
-        }
+        Ok(result)
+        // Removing routes may invalidate the cached best route; refresh it once.
+        Self::recompute_best_route(&env);
 
         Ok(())
     }
@@ -545,10 +543,10 @@ impl RouterCore {
     /// total-routed counter, and emits a `routed` event. If `name` is an alias,
     /// resolves to the original route.
     ///
-    /// When multiple scored routes exist, score-based selection is applied:
-    /// all route names are evaluated via `get_best_route` and the highest-scoring
-    /// non-paused route is returned automatically. If no scored routes exist,
-    /// falls back to the direct lookup by `name`.
+    /// When scored routes exist, score-based selection is applied via a cached
+    /// best-route key (maintained on score/pause/removal changes): the
+    /// highest-scoring non-paused route is returned automatically in O(1). If no
+    /// scored, non-paused route exists, falls back to the direct lookup by `name`.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment.
@@ -582,27 +580,17 @@ impl RouterCore {
             name.clone()
         };
 
-        // Score-based selection: if any route has a score, use get_best_route
-        // across all candidates to return the highest-scoring non-paused route.
-        let all_names = Self::get_route_names(&env);
-        let has_any_score = all_names
-            .iter()
-            .any(|n| env.storage().instance().has(&DataKey::Score(n.clone())));
-
-        let final_name = if has_any_score {
-            // Use score-based selection over all routes; fall back to resolved_name
-            match Self::get_best_route(
-                env.clone(),
-                all_names,
-                i64::MIN,
-                Some(resolved_name.clone()),
-            )? {
-                Some(best) => best,
-                None => resolved_name.clone(),
-            }
-        } else {
-            resolved_name.clone()
-        };
+        // Score-based selection: the best non-paused scored route is maintained
+        // in a cached storage key (DataKey::BestRoute), updated whenever scores,
+        // pause state, or routes change. This keeps resolution O(1) instead of
+        // scanning the entire RouteNames vector on every call. If no scored,
+        // non-paused route exists, the cache is absent and we fall back to the
+        // directly requested route.
+        let final_name = env
+            .storage()
+            .instance()
+            .get::<DataKey, String>(&DataKey::BestRoute)
+            .unwrap_or(resolved_name);
 
         let entry: RouteEntry = env
             .storage()
@@ -677,6 +665,9 @@ impl RouterCore {
 
         env.events()
             .publish((Symbol::new(&env, "route_paused"),), (name.clone(), paused));
+
+        // Pause state affects best-route eligibility; refresh the cache.
+        Self::recompute_best_route(&env);
 
         Ok(())
     }
@@ -999,6 +990,39 @@ impl RouterCore {
         Self::get_route_names(&env)
     }
 
+    /// Returns a page of registered route names.
+    ///
+    /// Avoids loading the entire `RouteNames` vector into the caller when the
+    /// route set is large. Returns up to `limit` names starting at index
+    /// `start`. An out-of-range `start` or a `limit` of zero yields an empty
+    /// vector. The order matches [`get_all_routes`] and is not otherwise
+    /// guaranteed.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `start` - Zero-based index of the first route name to return.
+    /// * `limit` - Maximum number of names to return.
+    ///
+    /// # Returns
+    /// A `Vec<String>` containing up to `limit` route names.
+    pub fn get_routes_paginated(env: Env, start: u32, limit: u32) -> Vec<String> {
+        let names = Self::get_route_names(&env);
+        let total = names.len();
+        let mut page = Vec::new(&env);
+
+        if start >= total || limit == 0 {
+            return page;
+        }
+
+        let end = start.saturating_add(limit).min(total);
+        let mut i = start;
+        while i < end {
+            page.push_back(names.get(i).unwrap());
+            i += 1;
+        }
+        page
+    }
+
     /// Returns the canonical route name that `alias_name` points to, or `None`.
     ///
     /// This is a read-only lookup that does not increment `total_routed` and
@@ -1052,6 +1076,9 @@ impl RouterCore {
             (Symbol::new(&env, "route_scored"),),
             (name, score.liquidity_score, score.fee_bps, score.reliability_score),
         );
+
+        // Scoring can change which route is best; refresh the cache.
+        Self::recompute_best_route(&env);
 
         Ok(())
     }
@@ -1191,6 +1218,62 @@ impl RouterCore {
             .unwrap_or(Vec::new(env))
     }
 
+    /// Recompute and cache the highest-scoring, non-paused route.
+    ///
+    /// Performs a single O(n) scan over all routes and stores the winner under
+    /// [`DataKey::BestRoute`] (or removes the key when no scored, non-paused
+    /// route exists). This is called only from write paths that can change the
+    /// outcome — scoring, pausing, and route removal — so that the hot
+    /// [`resolve`] path can read the result in O(1).
+    fn recompute_best_route(env: &Env) {
+        let names = Self::get_route_names(env);
+        let mut best_name: Option<String> = None;
+        let mut best_score: i64 = i64::MIN;
+
+        for name in names.iter() {
+            // Skip missing or paused routes
+            match env
+                .storage()
+                .instance()
+                .get::<DataKey, RouteEntry>(&DataKey::Route(name.clone()))
+            {
+                Some(e) if !e.paused => {}
+                _ => continue,
+            }
+
+            // Skip routes without a score
+            let score: RouteScore = match env
+                .storage()
+                .instance()
+                .get(&DataKey::Score(name.clone()))
+            {
+                Some(s) => s,
+                None => continue,
+            };
+
+            // Composite score: liquidity + reliability - fee_bps/10
+            let composite: i64 = score.liquidity_score as i64
+                + score.reliability_score as i64
+                - (score.fee_bps as i64 / 10);
+
+            if composite > best_score {
+                best_score = composite;
+                best_name = Some(name.clone());
+            }
+        }
+
+        match best_name {
+            Some(name) => {
+                env.storage().instance().set(&DataKey::BestRoute, &name);
+                env.events().publish(
+                    (Symbol::new(env, "best_route_selected"),),
+                    (name, best_score),
+                );
+            }
+            None => env.storage().instance().remove(&DataKey::BestRoute),
+        }
+    }
+
     /// Returns `true` if `name` is empty or consists entirely of ASCII whitespace
     /// characters (space 0x20, tab 0x09, newline 0x0A, vertical tab 0x0B,
     /// form feed 0x0C, carriage return 0x0D).
@@ -1244,6 +1327,137 @@ impl RouterCore {
         if env.storage().instance().has(&DataKey::Alias(name.clone())) {
             return Err(RouterError::RouteAlreadyExists);
         }
+
+        Ok(())
+    }
+
+    fn validate_metadata(meta: &RouteMetadata) -> Result<(), RouterError> {
+        if meta.description.len() > 256 || meta.tags.len() > 5 {
+            return Err(RouterError::InvalidMetadata);
+        }
+        Ok(())
+    }
+
+    fn router_error_message(err: RouterError) -> &'static str {
+        match err {
+            RouterError::AlreadyInitialized => "AlreadyInitialized",
+            RouterError::NotInitialized => "NotInitialized",
+            RouterError::Unauthorized => "Unauthorized",
+            RouterError::RouteNotFound => "RouteNotFound",
+            RouterError::RoutePaused => "RoutePaused",
+            RouterError::RouterPaused => "RouterPaused",
+            RouterError::RouteAlreadyExists => "RouteAlreadyExists",
+            RouterError::InvalidRouteName => "InvalidRouteName",
+            RouterError::InvalidMetadata => "InvalidMetadata",
+        }
+    }
+
+    fn register_route_internal(
+        env: &Env,
+        caller: &Address,
+        name: String,
+        address: Address,
+        metadata: Option<RouteMetadata>,
+    ) -> Result<(), RouterError> {
+        Self::validate_route_name(env, &name)?;
+        if let Some(ref meta) = metadata {
+            Self::validate_metadata(meta)?;
+        }
+
+        let entry = RouteEntry {
+            address: address.clone(),
+            name: name.clone(),
+            paused: false,
+            updated_by: caller.clone(),
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::Route(name.clone()), &entry);
+
+        if let Some(meta) = metadata {
+            env.storage()
+                .instance()
+                .set(&DataKey::Metadata(name.clone()), &meta);
+        }
+
+        let mut route_names = Self::get_route_names(env);
+        route_names.push_back(name.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::RouteNames, &route_names);
+
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RouteCount)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::RouteCount, &(count + 1));
+
+        env.events().publish(
+            (Symbol::new(env, "route_registered"),),
+            (name, address),
+        );
+
+        Ok(())
+    }
+
+    fn remove_route_internal(env: &Env, name: String) -> Result<(), RouterError> {
+        if !env.storage().instance().has(&DataKey::Route(name.clone())) {
+            return Err(RouterError::RouteNotFound);
+        }
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::Route(name.clone()));
+        env.storage()
+            .instance()
+            .remove(&DataKey::Metadata(name.clone()));
+
+        let route_names = Self::get_route_names(env);
+        let mut updated_route_names = Vec::new(env);
+        for route_name in route_names.iter() {
+            if route_name != name {
+                updated_route_names.push_back(route_name);
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::RouteNames, &updated_route_names);
+
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RouteCount)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::RouteCount, &count.saturating_sub(1));
+
+        let aliases = Self::get_aliases(env);
+        let mut updated_aliases = Vec::new(env);
+        for alias in aliases.iter() {
+            if let Some(original_name) = env
+                .storage()
+                .instance()
+                .get::<DataKey, String>(&DataKey::Alias(alias.clone()))
+            {
+                if original_name != name {
+                    updated_aliases.push_back(alias);
+                } else {
+                    env.storage()
+                        .instance()
+                        .remove(&DataKey::Alias(alias.clone()));
+                }
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::Aliases, &updated_aliases);
+
+        env.events()
+            .publish((Symbol::new(env, "route_removed"),), name);
 
         Ok(())
     }
@@ -2828,5 +3042,187 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results.get(0).unwrap(), BatchResolveResult::Ok(addr));
+    }
+
+    #[test]
+    fn test_register_routes_batch_all_succeed() {
+        let (env, admin, client) = setup();
+        let (a1, a2) = (Address::generate(&env), Address::generate(&env));
+        let routes = vec![
+            &env,
+            RouteRegisterInput {
+                name: String::from_str(&env, "oracle"),
+                address: a1.clone(),
+            },
+            RouteRegisterInput {
+                name: String::from_str(&env, "vault"),
+                address: a2.clone(),
+            },
+        ];
+        let result = client.register_routes_batch(&admin, &routes, &false);
+        assert_eq!(result.successes.len(), 2);
+        assert_eq!(result.failures.len(), 0);
+        assert_eq!(client.resolve(&routes.get(0).unwrap().name), a1);
+        assert_eq!(client.resolve(&routes.get(1).unwrap().name), a2);
+    }
+
+    #[test]
+    fn test_register_routes_batch_partial_errors() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let addr = Address::generate(&env);
+        client.register_route(&admin, &name, &addr, &None);
+        let routes = vec![
+            &env,
+            RouteRegisterInput {
+                name: name.clone(),
+                address: Address::generate(&env),
+            },
+            RouteRegisterInput {
+                name: String::from_str(&env, "vault"),
+                address: Address::generate(&env),
+            },
+        ];
+        let result = client.register_routes_batch(&admin, &routes, &false);
+        assert_eq!(result.successes.len(), 1);
+        assert_eq!(result.successes.get(0).unwrap().index, 1);
+        assert_eq!(result.failures.len(), 1);
+        assert_eq!(
+            result.failures.get(0).unwrap().message,
+            String::from_str(&env, "RouteAlreadyExists")
+        );
+    }
+
+    #[test]
+    fn test_remove_routes_batch_partial_errors() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let addr = Address::generate(&env);
+        client.register_route(&admin, &name, &addr, &None);
+        let names = vec![
+            &env,
+            name.clone(),
+            String::from_str(&env, "missing"),
+        ];
+        let result = client.remove_routes_batch(&admin, &names, &false);
+        assert_eq!(result.successes.len(), 1);
+        assert_eq!(result.failures.len(), 1);
+        assert_eq!(
+            result.failures.get(0).unwrap().message,
+            String::from_str(&env, "RouteNotFound")
+        );
+        let resolve_result = client.try_resolve(&name);
+        assert_eq!(resolve_result, Err(Ok(RouterError::RouteNotFound)));
+    // ── Issue #582: cached best-route selection & pagination ──────────────────
+
+    #[test]
+    fn test_resolve_uses_cached_best_route() {
+        let (env, admin, client) = setup();
+        let r1 = String::from_str(&env, "route-a");
+        let r2 = String::from_str(&env, "route-b");
+        let addr1 = Address::generate(&env);
+        let addr2 = Address::generate(&env);
+        client.register_route(&admin, &r1, &addr1, &None);
+        client.register_route(&admin, &r2, &addr2, &None);
+
+        // r2 scores higher than r1
+        client.set_route_score(&admin, &r1, &RouteScore { liquidity_score: 50, fee_bps: 30, reliability_score: 50 });
+        client.set_route_score(&admin, &r2, &RouteScore { liquidity_score: 90, fee_bps: 10, reliability_score: 90 });
+
+        // Resolving any route name returns the globally best scored route.
+        assert_eq!(client.resolve(&r1), addr2);
+        assert_eq!(client.resolve(&r2), addr2);
+    }
+
+    #[test]
+    fn test_cached_best_route_updates_when_best_paused() {
+        let (env, admin, client) = setup();
+        let r1 = String::from_str(&env, "route-a");
+        let r2 = String::from_str(&env, "route-b");
+        let addr1 = Address::generate(&env);
+        let addr2 = Address::generate(&env);
+        client.register_route(&admin, &r1, &addr1, &None);
+        client.register_route(&admin, &r2, &addr2, &None);
+        client.set_route_score(&admin, &r1, &RouteScore { liquidity_score: 50, fee_bps: 30, reliability_score: 50 });
+        client.set_route_score(&admin, &r2, &RouteScore { liquidity_score: 90, fee_bps: 10, reliability_score: 90 });
+
+        // Initially r2 is best.
+        assert_eq!(client.resolve(&r1), addr2);
+
+        // Pausing the best route promotes r1 in the cache.
+        client.set_route_paused(&admin, &r2, &true);
+        assert_eq!(client.resolve(&r1), addr1);
+    }
+
+    #[test]
+    fn test_cached_best_route_updates_on_remove() {
+        let (env, admin, client) = setup();
+        let r1 = String::from_str(&env, "route-a");
+        let r2 = String::from_str(&env, "route-b");
+        let addr1 = Address::generate(&env);
+        let addr2 = Address::generate(&env);
+        client.register_route(&admin, &r1, &addr1, &None);
+        client.register_route(&admin, &r2, &addr2, &None);
+        client.set_route_score(&admin, &r1, &RouteScore { liquidity_score: 50, fee_bps: 30, reliability_score: 50 });
+        client.set_route_score(&admin, &r2, &RouteScore { liquidity_score: 90, fee_bps: 10, reliability_score: 90 });
+
+        assert_eq!(client.resolve(&r1), addr2);
+
+        // Removing the best route falls back to the next-best.
+        client.remove_route(&admin, &r2);
+        assert_eq!(client.resolve(&r1), addr1);
+    }
+
+    #[test]
+    fn test_resolve_without_scores_uses_requested_route() {
+        let (env, admin, client) = setup();
+        let r1 = String::from_str(&env, "route-a");
+        let r2 = String::from_str(&env, "route-b");
+        let addr1 = Address::generate(&env);
+        let addr2 = Address::generate(&env);
+        client.register_route(&admin, &r1, &addr1, &None);
+        client.register_route(&admin, &r2, &addr2, &None);
+
+        // No scores set: each name resolves to its own address.
+        assert_eq!(client.resolve(&r1), addr1);
+        assert_eq!(client.resolve(&r2), addr2);
+    }
+
+    #[test]
+    fn test_get_routes_paginated_basic() {
+        let (env, admin, client) = setup();
+        let addr = Address::generate(&env);
+        let r1 = String::from_str(&env, "route-a");
+        let r2 = String::from_str(&env, "route-b");
+        let r3 = String::from_str(&env, "route-c");
+        client.register_route(&admin, &r1, &addr, &None);
+        client.register_route(&admin, &r2, &addr, &None);
+        client.register_route(&admin, &r3, &addr, &None);
+
+        // First page of two.
+        let page = client.get_routes_paginated(&0, &2);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page.get(0).unwrap(), r1);
+        assert_eq!(page.get(1).unwrap(), r2);
+
+        // Second page returns the remaining one.
+        let page = client.get_routes_paginated(&2, &2);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page.get(0).unwrap(), r3);
+    }
+
+    #[test]
+    fn test_get_routes_paginated_edge_cases() {
+        let (env, admin, client) = setup();
+        let addr = Address::generate(&env);
+        let r1 = String::from_str(&env, "route-a");
+        client.register_route(&admin, &r1, &addr, &None);
+
+        // start past the end -> empty
+        assert_eq!(client.get_routes_paginated(&5, &10).len(), 0);
+        // zero limit -> empty
+        assert_eq!(client.get_routes_paginated(&0, &0).len(), 0);
+        // limit larger than remaining -> clamped
+        assert_eq!(client.get_routes_paginated(&0, &100).len(), 1);
     }
 }

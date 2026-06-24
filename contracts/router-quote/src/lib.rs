@@ -72,6 +72,7 @@ pub enum QuoteError {
     InvalidFeeBps = 5,
     NoQuotesProvided = 6,
     RouteNotFound = 7,
+    ArithmeticOverflow = 8,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -121,16 +122,6 @@ impl RouterQuote {
         );
 
         Ok(())
-    /// Return the current admin address.
-    /// Get the current admin address.
-    ///
-    /// # Errors
-    /// Returns `QuoteError::NotInitialized` if the contract has not been initialized.
-    pub fn admin(env: Env) -> Result<Address, QuoteError> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(QuoteError::NotInitialized)
     }
 
     /// Set fee in basis points for a specific route.
@@ -211,6 +202,7 @@ impl RouterQuote {
     ///
     /// # Errors
     /// * [`QuoteError::InvalidAmount`] — if amount_in <= 0.
+    /// * [`QuoteError::ArithmeticOverflow`] — if the fee or output calculation overflows.
     pub fn get_quote(env: Env, request: QuoteRequest) -> Result<QuoteResponse, QuoteError> {
         if request.amount_in <= 0 {
             return Err(QuoteError::InvalidAmount);
@@ -223,10 +215,13 @@ impl RouterQuote {
             .amount_in
             .checked_mul(fee_bps as i128)
             .and_then(|v| v.checked_div(10000))
-            .unwrap_or(0);
+            .ok_or(QuoteError::ArithmeticOverflow)?;
 
         // Calculate output: amount_out = amount_in - fee_amount
-        let amount_out = request.amount_in.checked_sub(fee_amount).unwrap_or(0);
+        let amount_out = request
+            .amount_in
+            .checked_sub(fee_amount)
+            .ok_or(QuoteError::ArithmeticOverflow)?;
 
         let response = QuoteResponse {
             route: request.route.clone(),
@@ -529,6 +524,129 @@ mod tests {
 
         let result = client.try_get_quote(&request);
         assert_eq!(result, Err(Ok(QuoteError::InvalidAmount)));
+    }
+
+    #[test]
+    fn test_get_quote_negative_amount_fails() {
+        let (env, _admin, client) = setup();
+        let token_in = Address::generate(&env);
+        let token_out = Address::generate(&env);
+        let request = QuoteRequest {
+            route: String::from_str(&env, "uniswap"),
+            token_in,
+            token_out,
+            amount_in: -5000,
+        };
+
+        let result = client.try_get_quote(&request);
+        assert_eq!(result, Err(Ok(QuoteError::InvalidAmount)));
+    }
+
+    #[test]
+    fn test_get_quote_max_amount_in_overflows() {
+        let (env, _admin, client) = setup(); // default fee_bps = 100
+        let token_in = Address::generate(&env);
+        let token_out = Address::generate(&env);
+        let request = QuoteRequest {
+            route: String::from_str(&env, "uniswap"),
+            token_in,
+            token_out,
+            amount_in: i128::MAX,
+        };
+
+        // amount_in * fee_bps overflows i128 before the division by 10000 can
+        // bring it back down, so the quote must fail rather than silently
+        // falling back to a zero fee (which would bypass the fee entirely).
+        let result = client.try_get_quote(&request);
+        assert_eq!(result, Err(Ok(QuoteError::ArithmeticOverflow)));
+    }
+
+    #[test]
+    fn test_get_quote_rounds_fee_down_to_zero() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "uniswap");
+        client.set_route_fee(&admin, &route, &1); // 0.01%
+
+        let token_in = Address::generate(&env);
+        let token_out = Address::generate(&env);
+        let request = QuoteRequest {
+            route,
+            token_in,
+            token_out,
+            amount_in: 1,
+        };
+
+        let response = client.get_quote(&request);
+        // 1 * 1 / 10000 truncates to 0: the fee rounds down and the full
+        // amount passes through.
+        assert_eq!(response.fee_amount, 0);
+        assert_eq!(response.amount_out, 1);
+    }
+
+    #[test]
+    fn test_get_quote_full_fee_takes_entire_amount() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "uniswap");
+        client.set_route_fee(&admin, &route, &10000); // 100%
+
+        let token_in = Address::generate(&env);
+        let token_out = Address::generate(&env);
+        let request = QuoteRequest {
+            route,
+            token_in,
+            token_out,
+            amount_in: 10000,
+        };
+
+        let response = client.get_quote(&request);
+        assert_eq!(response.fee_amount, 10000);
+        assert_eq!(response.amount_out, 0);
+    }
+
+    #[test]
+    fn test_get_quote_near_full_fee() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "uniswap");
+        client.set_route_fee(&admin, &route, &9999); // 99.99%
+
+        let token_in = Address::generate(&env);
+        let token_out = Address::generate(&env);
+        let request = QuoteRequest {
+            route,
+            token_in,
+            token_out,
+            amount_in: 10000,
+        };
+
+        let response = client.get_quote(&request);
+        assert_eq!(response.fee_amount, 9999);
+        assert_eq!(response.amount_out, 10000 / 10000);
+    }
+
+    #[test]
+    fn test_get_quotes_fails_entirely_when_one_request_overflows() {
+        let (env, _admin, client) = setup();
+        let token_in = Address::generate(&env);
+        let token_out = Address::generate(&env);
+
+        let mut requests = Vec::new(&env);
+        requests.push_back(QuoteRequest {
+            route: String::from_str(&env, "uniswap"),
+            token_in: token_in.clone(),
+            token_out: token_out.clone(),
+            amount_in: 10000,
+        });
+        requests.push_back(QuoteRequest {
+            route: String::from_str(&env, "sushiswap"),
+            token_in,
+            token_out,
+            amount_in: i128::MAX,
+        });
+
+        // A batch must not silently return partial/incorrect results when one
+        // quote in it overflows — the whole call should fail.
+        let result = client.try_get_quotes(&requests);
+        assert_eq!(result, Err(Ok(QuoteError::ArithmeticOverflow)));
     }
 
     #[test]

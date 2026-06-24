@@ -57,16 +57,7 @@ pub struct CallDescriptor {
     pub args: Vec<Val>,
 }
 
-/// Result of a single call in a batch.
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct CallResult {
-    pub target: Address,
-    pub function: Symbol,
-    pub success: bool,
-}
-
-/// Summary of a batch execution.
+/// Summary of a batch execution (legacy aggregate counts).
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct BatchSummary {
@@ -176,7 +167,8 @@ impl RouterMulticall {
         calls: Vec<CallDescriptor>,
         simulate: bool,
         store_results: bool,
-    ) -> Result<BatchSummary, MulticallError> {
+        fail_fast: bool,
+    ) -> Result<router_common::BatchCallResult, MulticallError> {
         caller.require_auth();
 
         // Reentrancy guard
@@ -209,31 +201,35 @@ impl RouterMulticall {
             .get(&DataKey::TotalBatches)
             .unwrap_or(0);
 
-        let mut succeeded = 0u32;
-        let mut failed = 0u32;
-        let mut budget_exceeded_count = 0u32;
-        let total = calls.len();
-
+        let mut result = router_common::BatchCallResult::new(&env);
         let mut call_index = 0u32;
         for call in calls.iter() {
             let args: Vec<Val> = call.args.clone();
-            let result = env.try_invoke_contract::<Val, Val>(&call.target, &call.function, args);
+            let invoke_result =
+                env.try_invoke_contract::<Val, Val>(&call.target, &call.function, args);
 
-            let success = result.is_ok();
+            let success = invoke_result.is_ok();
+            let call_result = router_common::CallResult {
+                target: call.target.clone(),
+                function: call.function.clone(),
+                success,
+            };
 
             if success {
-                succeeded += 1;
+                result.record_success(call_index, call_result);
             } else {
-                failed += 1;
-                if call.instruction_budget.is_some() {
-                    budget_exceeded_count += 1;
-                }
+                let failure_msg = if call.instruction_budget.is_some() {
+                    "budget_exceeded"
+                } else {
+                    "invoke_failed"
+                };
+                result.record_failure(&env, call_index, failure_msg);
             }
 
             if store_results {
                 env.storage().instance().set(
                     &DataKey::BatchResult(batch_id, call_index),
-                    &CallResult {
+                    &router_common::CallResult {
                         target: call.target.clone(),
                         function: call.function.clone(),
                         success,
@@ -246,9 +242,15 @@ impl RouterMulticall {
                 (&caller, &call.target, &call.function, success),
             );
 
-            if !success && call.required {
-                env.storage().instance().remove(&DataKey::Executing);
-                return Err(MulticallError::RequiredCallFailed);
+            if !success {
+                if call.required {
+                    env.storage().instance().remove(&DataKey::Executing);
+                    return Err(MulticallError::RequiredCallFailed);
+                }
+                if fail_fast {
+                    env.storage().instance().remove(&DataKey::Executing);
+                    return Ok(result);
+                }
             }
 
             call_index += 1;
@@ -260,12 +262,7 @@ impl RouterMulticall {
 
         env.storage().instance().remove(&DataKey::Executing);
 
-        Ok(BatchSummary {
-            total,
-            succeeded,
-            failed,
-            budget_exceeded_count,
-        })
+        Ok(result)
     }
 
     /// Update the maximum batch size.
@@ -390,7 +387,7 @@ impl RouterMulticall {
 mod tests {
     extern crate std;
     use super::*;
-    use soroban_sdk::{testutils::{Address as _, Events}, Env, FromVal, Symbol, Vec};
+    use soroban_sdk::{testutils::{Address as _, Events}, Env, FromVal, IntoVal, String, Symbol, Vec};
 
     fn setup() -> (Env, Address, RouterMulticallClient<'static>) {
         let env = Env::default();
@@ -400,6 +397,24 @@ mod tests {
         let admin = Address::generate(&env);
         client.initialize(&admin, &10);
         (env, admin, client)
+    }
+
+    fn batch_counts(result: &router_common::BatchCallResult) -> (u32, u32, u32) {
+        let succeeded = result.successes.len() as u32;
+        let failed = result.failures.len() as u32;
+        (succeeded + failed, succeeded, failed)
+    }
+
+    fn budget_failure_count(env: &Env, result: &router_common::BatchCallResult) -> u32 {
+        let mut count = 0u32;
+        let budget = String::from_str(env, "budget_exceeded");
+        for i in 0..result.failures.len() {
+            let failure = result.failures.get(i).unwrap();
+            if failure.message == budget {
+                count += 1;
+            }
+        }
+        count
     }
 
     #[test]
@@ -421,7 +436,7 @@ mod tests {
         let (env, _admin, client) = setup();
         let caller = Address::generate(&env);
         let calls: Vec<CallDescriptor> = Vec::new(&env);
-        let result = client.try_execute_batch(&caller, &calls, &false, &false);
+        let result = client.try_execute_batch(&caller, &calls, &false, &false, &false);
         assert_eq!(result, Err(Ok(MulticallError::EmptyBatch)));
     }
 
@@ -440,7 +455,7 @@ mod tests {
                 args: Vec::new(&env),
             });
         }
-        let result = client.try_execute_batch(&caller, &calls, &false, &false);
+        let result = client.try_execute_batch(&caller, &calls, &false, &false, &false);
         assert_eq!(result, Err(Ok(MulticallError::BatchTooLarge)));
     }
 
@@ -517,11 +532,12 @@ mod tests {
             args: Vec::new(&env),
         });
 
-        let summary = client.execute_batch(&caller, &calls, &false, &false);
-        assert_eq!(summary.total, 2);
-        assert_eq!(summary.succeeded, 2);
-        assert_eq!(summary.failed, 0);
-        assert_eq!(summary.budget_exceeded_count, 0);
+        let summary = client.execute_batch(&caller, &calls, &false, &false, &false);
+        let (total, succeeded, failed) = batch_counts(&summary);
+        assert_eq!(total, 2);
+        assert_eq!(succeeded, 2);
+        assert_eq!(failed, 0);
+        assert_eq!(budget_failure_count(&env, &summary), 0);
         assert_eq!(client.total_batches(), 1);
     }
 
@@ -557,10 +573,11 @@ mod tests {
             args: Vec::new(&env),
         });
 
-        let summary = client.execute_batch(&caller, &calls, &false, &false);
-        assert_eq!(summary.total, 3);
-        assert_eq!(summary.succeeded, 2);
-        assert_eq!(summary.failed, 1);
+        let summary = client.execute_batch(&caller, &calls, &false, &false, &false);
+        let (total, succeeded, failed) = batch_counts(&summary);
+        assert_eq!(total, 3);
+        assert_eq!(succeeded, 2);
+        assert_eq!(failed, 1);
         assert_eq!(client.total_batches(), 1);
     }
 
@@ -596,7 +613,7 @@ mod tests {
             args: Vec::new(&env),
         });
 
-        let result = client.try_execute_batch(&caller, &calls, &false, &false);
+        let result = client.try_execute_batch(&caller, &calls, &false, &false, &false);
         assert_eq!(result, Err(Ok(MulticallError::RequiredCallFailed)));
         // Total batches should NOT increment if it failed
         assert_eq!(client.total_batches(), 0);
@@ -681,11 +698,12 @@ mod tests {
             args: Vec::new(&env),
         });
 
-        let summary = client.execute_batch(&caller, &calls, &false, &false);
-        assert_eq!(summary.total, 3);
-        assert_eq!(summary.succeeded, 1);
-        assert_eq!(summary.failed, 2);
-        assert_eq!(summary.budget_exceeded_count, 1);
+        let summary = client.execute_batch(&caller, &calls, &false, &false, &false);
+        let (total, succeeded, failed) = batch_counts(&summary);
+        assert_eq!(total, 3);
+        assert_eq!(succeeded, 1);
+        assert_eq!(failed, 2);
+        assert_eq!(budget_failure_count(&env, &summary), 1);
     }
 
     #[test]
@@ -700,12 +718,14 @@ mod tests {
             function: Symbol::new(&env, "success"),
             required: true,
             instruction_budget: None,
+            args: Vec::new(&env),
         });
 
-        let summary = client.execute_batch(&caller, &calls, &true, &false);
-        assert_eq!(summary.total, 1);
-        assert_eq!(summary.succeeded, 1);
-        assert_eq!(summary.failed, 0);
+        let summary = client.execute_batch(&caller, &calls, &true, &false, &false);
+        let (total, succeeded, failed) = batch_counts(&summary);
+        assert_eq!(total, 1);
+        assert_eq!(succeeded, 1);
+        assert_eq!(failed, 0);
         // Batch counter should NOT increment in simulate mode
         assert_eq!(client.total_batches(), 0);
     }
@@ -722,18 +742,21 @@ mod tests {
             function: Symbol::new(&env, "success"),
             required: true,
             instruction_budget: None,
+            args: Vec::new(&env),
         });
         calls.push_back(CallDescriptor {
             target: mock_id.clone(),
             function: Symbol::new(&env, "fail"),
             required: false,
             instruction_budget: None,
+            args: Vec::new(&env),
         });
 
-        let summary = client.execute_batch(&caller, &calls, &true, &false);
-        assert_eq!(summary.total, 2);
-        assert_eq!(summary.succeeded, 1);
-        assert_eq!(summary.failed, 1);
+        let summary = client.execute_batch(&caller, &calls, &true, &false, &false);
+        let (total, succeeded, failed) = batch_counts(&summary);
+        assert_eq!(total, 2);
+        assert_eq!(succeeded, 1);
+        assert_eq!(failed, 1);
     }
 
     #[test]
@@ -748,18 +771,21 @@ mod tests {
             function: Symbol::new(&env, "success"),
             required: true,
             instruction_budget: None,
+            args: Vec::new(&env),
         });
         calls.push_back(CallDescriptor {
             target: mock_id.clone(),
             function: Symbol::new(&env, "fail"),
             required: false,
             instruction_budget: None,
+            args: Vec::new(&env),
         });
 
-        let summary = client.execute_batch(&caller, &calls, &false, &false);
-        assert_eq!(summary.total, 2);
-        assert_eq!(summary.succeeded, 1);
-        assert_eq!(summary.failed, 1);
+        let summary = client.execute_batch(&caller, &calls, &false, &false, &false);
+        let (total, succeeded, failed) = batch_counts(&summary);
+        assert_eq!(total, 2);
+        assert_eq!(succeeded, 1);
+        assert_eq!(failed, 1);
     }
 
     #[test]
@@ -777,7 +803,7 @@ mod tests {
                 args: Vec::new(&env),
             });
 
-            client.execute_batch(&caller, &calls, &false, &false);
+            client.execute_batch(&caller, &calls, &false, &false, &false);
 
             // Find the call_result event — tuple is (contract_id, topics: Vec<Val>, data: Val)
             let all_events = env.events().all();
@@ -810,9 +836,10 @@ mod tests {
             function: Symbol::new(&env, "fail"),
             required: true,
             instruction_budget: None,
+            args: Vec::new(&env),
         });
 
-        let result = client.try_execute_batch(&caller, &calls, &false, &false);
+        let result = client.try_execute_batch(&caller, &calls, &false, &false, &false);
         assert_eq!(result, Err(Ok(MulticallError::RequiredCallFailed)));
         assert_eq!(client.total_batches(), 0);
     }
@@ -829,12 +856,13 @@ mod tests {
             function: Symbol::new(&env, "success"),
             required: true,
             instruction_budget: None,
+            args: Vec::new(&env),
         });
 
-        client.execute_batch(&caller, &calls, &false, &false);
+        client.execute_batch(&caller, &calls, &false, &false, &false);
 
         // Flag must be cleared — a second call must succeed (not return Reentrancy)
-        let result = client.try_execute_batch(&caller, &calls, &false, &false);
+        let result = client.try_execute_batch(&caller, &calls, &false, &false, &false);
         assert!(result.is_ok());
     }
 
@@ -850,10 +878,11 @@ mod tests {
             function: Symbol::new(&env, "fail"),
             required: true,
             instruction_budget: None,
+            args: Vec::new(&env),
         });
 
         // First call fails
-        let _ = client.try_execute_batch(&caller, &fail_calls, &false, &false);
+        let _ = client.try_execute_batch(&caller, &fail_calls, &false, &false, &false);
 
         // Flag must be cleared — a subsequent call must not return Reentrancy
         let mut ok_calls = Vec::new(&env);
@@ -862,8 +891,9 @@ mod tests {
             function: Symbol::new(&env, "success"),
             required: true,
             instruction_budget: None,
+            args: Vec::new(&env),
         });
-        let result = client.try_execute_batch(&caller, &ok_calls, &false, &false);
+        let result = client.try_execute_batch(&caller, &ok_calls, &false, &false, &false);
         assert!(result.is_ok());
     }
 }
