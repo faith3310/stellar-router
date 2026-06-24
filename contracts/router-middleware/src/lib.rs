@@ -15,6 +15,7 @@
 //! - `pre_call` — Pre-call validation hook executed
 //! - `post_call` — Post-call hook executed
 //! - `circuit_opened` — Circuit breaker opened for route
+//! - `circuit_closed` — Circuit breaker closed after successful recovery
 //! - `middleware_enabled` — Global middleware enabled/disabled
 //! - `call_log_cleared` — Call log cleared for route
 //! - `admin_transferred` — Admin transferred to new address
@@ -674,6 +675,11 @@ impl RouterMiddleware {
                     if route_call_state.circuit_breaker.is_half_open {
                         route_call_state.circuit_breaker.is_half_open = false;
                         route_call_state.circuit_breaker.failure_count = 0;
+                        route_call_state.circuit_breaker.opened_at = 0;
+                        env.events().publish(
+                            (Symbol::new(&env, "circuit_closed"),),
+                            route.clone(),
+                        );
                     } else if !route_call_state.circuit_breaker.is_open
                         && route_call_state.circuit_breaker.failure_count > 0
                     {
@@ -2332,6 +2338,49 @@ mod tests {
         assert!(!state_recovered.is_open, "is_open should be false");
         assert_eq!(state_recovered.failure_count, 0, "failure_count should be 0");
         assert_eq!(state_recovered.opened_at, 0, "opened_at should be 0");
+    }
+
+    #[test]
+    fn test_circuit_closed_event_emitted_on_recovery() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        let caller = Address::generate(&env);
+
+        // failure_threshold=1, recovery_window=60s
+        client.configure_route(&admin, &route, &0, &0, &true, &1, &60, &0);
+
+        // Trip the circuit
+        client.post_call(&caller, &route, &false);
+        assert_eq!(
+            client.try_pre_call(&caller, &route),
+            Err(Ok(MiddlewareError::CircuitOpen))
+        );
+
+        // Advance past recovery window so pre_call enters half-open state
+        env.ledger().with_mut(|l| l.timestamp += 61);
+
+        // pre_call transitions to half-open; call succeeds
+        assert!(client.try_pre_call(&caller, &route).is_ok());
+
+        // Probe succeeds → circuit_closed event must be emitted
+        client.post_call(&caller, &route, &true);
+
+        let events = env.events().all();
+        let closed_event = events.iter().find(|e| {
+            e.1.get(0)
+                .map(|v| {
+                    let s: Symbol = v.into_val(&env);
+                    s == Symbol::new(&env, "circuit_closed")
+                })
+                .unwrap_or(false)
+        });
+        assert!(closed_event.is_some(), "circuit_closed event must be emitted");
+
+        // Circuit should now be fully closed
+        let state = client.circuit_breaker_state(&route).unwrap();
+        assert!(!state.is_open);
+        assert!(!state.is_half_open);
+        assert_eq!(state.failure_count, 0);
     }
 
     #[test]
