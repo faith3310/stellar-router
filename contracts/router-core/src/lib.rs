@@ -54,7 +54,7 @@ pub enum DataKey {
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 #[contracttype]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RouteMetadata {
     /// Human-readable description (max 256 chars)
     pub description: String,
@@ -82,7 +82,6 @@ pub struct RouteEntry {
 pub struct RouteRegisterInput {
     pub name: String,
     pub address: Address,
-    pub metadata: Option<RouteMetadata>,
 }
 
 
@@ -415,57 +414,65 @@ impl RouterCore {
         env: Env,
         caller: Address,
         routes: Vec<RouteRegisterInput>,
-    ) -> Result<(), RouterError> {
+        fail_fast: bool,
+    ) -> Result<router_common::BatchResult, RouterError> {
         caller.require_auth();
         router_common::require_admin_simple!(&env, &caller, &DataKey::Admin, RouterError)?;
 
-        // Validation phase: check all routes before writing any
-        let mut seen = Vec::new(&env);
-        for route in routes.iter() {
-            if seen.contains(&route.name) {
-                return Err(RouterError::RouteAlreadyExists);
-            }
-            Self::validate_route_name(&env, &route.name)?;
+        let mut result = router_common::BatchResult::new(&env);
 
-            // Validate metadata if provided
-            if let Some(ref meta) = route.metadata {
-                if meta.description.len() > 256 {
-                    return Err(RouterError::InvalidMetadata);
+        if fail_fast {
+            let mut seen = Vec::new(&env);
+            for (index, route) in routes.iter().enumerate() {
+                let idx = index as u32;
+                if seen.contains(&route.name) {
+                    result.record_failure(&env, idx, "RouteAlreadyExists");
+                    return Ok(result);
                 }
-                if meta.tags.len() > 5 {
-                    return Err(RouterError::InvalidMetadata);
+                if let Err(err) = Self::validate_route_name(&env, &route.name) {
+                    result.record_failure(&env, idx, Self::router_error_message(err));
+                    return Ok(result);
+                }
+                if env
+                    .storage()
+                    .instance()
+                    .has(&DataKey::Route(route.name.clone()))
+                {
+                    result.record_failure(&env, idx, "RouteAlreadyExists");
+                    return Ok(result);
+                }
+                seen.push_back(route.name.clone());
+            }
+
+            for (index, route) in routes.iter().enumerate() {
+                Self::register_route_internal(
+                    &env,
+                    &caller,
+                    route.name.clone(),
+                    route.address.clone(),
+                    None,
+                )?;
+                result.record_success(index as u32);
+            }
+        } else {
+            for (index, route) in routes.iter().enumerate() {
+                let idx = index as u32;
+                match Self::register_route_internal(
+                    &env,
+                    &caller,
+                    route.name.clone(),
+                    route.address.clone(),
+                    None,
+                ) {
+                    Ok(()) => result.record_success(idx),
+                    Err(err) => {
+                        result.record_failure(&env, idx, Self::router_error_message(err));
+                    }
                 }
             }
-            seen.push_back(route.name.clone());
         }
 
-        // Commit phase: write all routes
-        let mut route_names = Self::get_route_names(&env);
-        for route in routes.iter() {
-            let entry = RouteEntry {
-                address: route.address.clone(),
-                name: route.name.clone(),
-                paused: false,
-                updated_by: caller.clone(),
-                metadata: route.metadata.clone(),
-            };
-            env.storage()
-                .instance()
-                .set(&DataKey::Route(route.name.clone()), &entry);
-
-            route_names.push_back(route.name.clone());
-
-            env.events().publish(
-                (Symbol::new(&env, "route_registered"),),
-                (route.name.clone(), entry.address.clone()),
-            );
-        }
-
-        env.storage()
-            .instance()
-            .set(&DataKey::RouteNames, &route_names);
-
-        Ok(())
+        Ok(result)
     }
 
     /// Remove multiple routes in a single transaction.
@@ -490,55 +497,39 @@ impl RouterCore {
         env: Env,
         caller: Address,
         names: Vec<String>,
-    ) -> Result<(), RouterError> {
+        fail_fast: bool,
+    ) -> Result<router_common::BatchResult, RouterError> {
         caller.require_auth();
         router_common::require_admin_simple!(&env, &caller, &DataKey::Admin, RouterError)?;
 
-        // Validation phase: check all routes exist
-        for name in names.iter() {
-            if !env.storage().instance().has(&DataKey::Route(name.clone())) {
-                return Err(RouterError::RouteNotFound);
-            }
-        }
+        let mut result = router_common::BatchResult::new(&env);
 
-        // Commit phase: remove all routes
-        let route_names = Self::get_route_names(&env);
-        let mut updated_route_names = Vec::new(&env);
-        for route_name in route_names.iter() {
-            if !names.contains(&route_name) {
-                updated_route_names.push_back(route_name);
+        if fail_fast {
+            for (index, name) in names.iter().enumerate() {
+                let idx = index as u32;
+                if !env.storage().instance().has(&DataKey::Route(name.clone())) {
+                    result.record_failure(&env, idx, "RouteNotFound");
+                    return Ok(result);
+                }
             }
-        }
-        env.storage()
-            .instance()
-            .set(&DataKey::RouteNames, &updated_route_names);
 
-        // Clean up aliases pointing to removed routes
-        let aliases = Self::get_aliases(&env);
-        let mut updated_aliases = Vec::new(&env);
-        for alias in aliases.iter() {
-            if let Some(original_name) = env.storage().instance().get::<DataKey, String>(&DataKey::Alias(alias.clone())) {
-                if names.contains(&original_name) {
-                    // Remove this dangling alias
-                    env.storage().instance().remove(&DataKey::Alias(alias.clone()));
-                } else {
-                    // Keep this alias
-                    updated_aliases.push_back(alias);
+            for (index, name) in names.iter().enumerate() {
+                Self::remove_route_internal(&env, name.clone())?;
+                result.record_success(index as u32);
+            }
+        } else {
+            for (index, name) in names.iter().enumerate() {
+                let idx = index as u32;
+                match Self::remove_route_internal(&env, name.clone()) {
+                    Ok(()) => result.record_success(idx),
+                    Err(err) => {
+                        result.record_failure(&env, idx, Self::router_error_message(err));
+                    }
                 }
             }
         }
-        env.storage().instance().set(&DataKey::Aliases, &updated_aliases);
 
-        // Remove route entries and emit events
-        for name in names.iter() {
-            env.storage()
-                .instance()
-                .remove(&DataKey::Route(name.clone()));
-
-            env.events()
-                .publish((Symbol::new(&env, "route_removed"),), name.clone());
-        }
-
+        Ok(result)
         // Removing routes may invalidate the cached best route; refresh it once.
         Self::recompute_best_route(&env);
 
@@ -1336,6 +1327,137 @@ impl RouterCore {
         if env.storage().instance().has(&DataKey::Alias(name.clone())) {
             return Err(RouterError::RouteAlreadyExists);
         }
+
+        Ok(())
+    }
+
+    fn validate_metadata(meta: &RouteMetadata) -> Result<(), RouterError> {
+        if meta.description.len() > 256 || meta.tags.len() > 5 {
+            return Err(RouterError::InvalidMetadata);
+        }
+        Ok(())
+    }
+
+    fn router_error_message(err: RouterError) -> &'static str {
+        match err {
+            RouterError::AlreadyInitialized => "AlreadyInitialized",
+            RouterError::NotInitialized => "NotInitialized",
+            RouterError::Unauthorized => "Unauthorized",
+            RouterError::RouteNotFound => "RouteNotFound",
+            RouterError::RoutePaused => "RoutePaused",
+            RouterError::RouterPaused => "RouterPaused",
+            RouterError::RouteAlreadyExists => "RouteAlreadyExists",
+            RouterError::InvalidRouteName => "InvalidRouteName",
+            RouterError::InvalidMetadata => "InvalidMetadata",
+        }
+    }
+
+    fn register_route_internal(
+        env: &Env,
+        caller: &Address,
+        name: String,
+        address: Address,
+        metadata: Option<RouteMetadata>,
+    ) -> Result<(), RouterError> {
+        Self::validate_route_name(env, &name)?;
+        if let Some(ref meta) = metadata {
+            Self::validate_metadata(meta)?;
+        }
+
+        let entry = RouteEntry {
+            address: address.clone(),
+            name: name.clone(),
+            paused: false,
+            updated_by: caller.clone(),
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::Route(name.clone()), &entry);
+
+        if let Some(meta) = metadata {
+            env.storage()
+                .instance()
+                .set(&DataKey::Metadata(name.clone()), &meta);
+        }
+
+        let mut route_names = Self::get_route_names(env);
+        route_names.push_back(name.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::RouteNames, &route_names);
+
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RouteCount)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::RouteCount, &(count + 1));
+
+        env.events().publish(
+            (Symbol::new(env, "route_registered"),),
+            (name, address),
+        );
+
+        Ok(())
+    }
+
+    fn remove_route_internal(env: &Env, name: String) -> Result<(), RouterError> {
+        if !env.storage().instance().has(&DataKey::Route(name.clone())) {
+            return Err(RouterError::RouteNotFound);
+        }
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::Route(name.clone()));
+        env.storage()
+            .instance()
+            .remove(&DataKey::Metadata(name.clone()));
+
+        let route_names = Self::get_route_names(env);
+        let mut updated_route_names = Vec::new(env);
+        for route_name in route_names.iter() {
+            if route_name != name {
+                updated_route_names.push_back(route_name);
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::RouteNames, &updated_route_names);
+
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RouteCount)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::RouteCount, &count.saturating_sub(1));
+
+        let aliases = Self::get_aliases(env);
+        let mut updated_aliases = Vec::new(env);
+        for alias in aliases.iter() {
+            if let Some(original_name) = env
+                .storage()
+                .instance()
+                .get::<DataKey, String>(&DataKey::Alias(alias.clone()))
+            {
+                if original_name != name {
+                    updated_aliases.push_back(alias);
+                } else {
+                    env.storage()
+                        .instance()
+                        .remove(&DataKey::Alias(alias.clone()));
+                }
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::Aliases, &updated_aliases);
+
+        env.events()
+            .publish((Symbol::new(env, "route_removed"),), name);
 
         Ok(())
     }
@@ -2922,6 +3044,75 @@ mod tests {
         assert_eq!(results.get(0).unwrap(), BatchResolveResult::Ok(addr));
     }
 
+    #[test]
+    fn test_register_routes_batch_all_succeed() {
+        let (env, admin, client) = setup();
+        let (a1, a2) = (Address::generate(&env), Address::generate(&env));
+        let routes = vec![
+            &env,
+            RouteRegisterInput {
+                name: String::from_str(&env, "oracle"),
+                address: a1.clone(),
+            },
+            RouteRegisterInput {
+                name: String::from_str(&env, "vault"),
+                address: a2.clone(),
+            },
+        ];
+        let result = client.register_routes_batch(&admin, &routes, &false);
+        assert_eq!(result.successes.len(), 2);
+        assert_eq!(result.failures.len(), 0);
+        assert_eq!(client.resolve(&routes.get(0).unwrap().name), a1);
+        assert_eq!(client.resolve(&routes.get(1).unwrap().name), a2);
+    }
+
+    #[test]
+    fn test_register_routes_batch_partial_errors() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let addr = Address::generate(&env);
+        client.register_route(&admin, &name, &addr, &None);
+        let routes = vec![
+            &env,
+            RouteRegisterInput {
+                name: name.clone(),
+                address: Address::generate(&env),
+            },
+            RouteRegisterInput {
+                name: String::from_str(&env, "vault"),
+                address: Address::generate(&env),
+            },
+        ];
+        let result = client.register_routes_batch(&admin, &routes, &false);
+        assert_eq!(result.successes.len(), 1);
+        assert_eq!(result.successes.get(0).unwrap().index, 1);
+        assert_eq!(result.failures.len(), 1);
+        assert_eq!(
+            result.failures.get(0).unwrap().message,
+            String::from_str(&env, "RouteAlreadyExists")
+        );
+    }
+
+    #[test]
+    fn test_remove_routes_batch_partial_errors() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let addr = Address::generate(&env);
+        client.register_route(&admin, &name, &addr, &None);
+        let names = vec![
+            &env,
+            name.clone(),
+            String::from_str(&env, "missing"),
+        ];
+        let result = client.remove_routes_batch(&admin, &names, &false);
+        assert_eq!(result.successes.len(), 1);
+        assert_eq!(result.failures.len(), 1);
+        assert_eq!(
+            result.failures.get(0).unwrap().message,
+            String::from_str(&env, "RouteNotFound")
+        );
+        let resolve_result = client.try_resolve(&name);
+        assert_eq!(resolve_result, Err(Ok(RouterError::RouteNotFound)));
     // ── Issue #582: cached best-route selection & pagination ──────────────────
 
     #[test]
