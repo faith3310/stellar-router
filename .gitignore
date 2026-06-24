@@ -1,4 +1,5 @@
 target/
+storage-profile.txt
 **/test_snapshots/
 benches/src/scrap-menu/
 .DS_Store
