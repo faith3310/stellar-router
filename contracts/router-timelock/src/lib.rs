@@ -26,6 +26,7 @@ pub enum DataKey {
     MinDelay,
     Op(Bytes),          // op_id -> Op
     PendingOps,         // Vec<Bytes> — IDs of ops that are neither executed nor cancelled
+    MaxPendingOps,      // u32 — Maximum allowed pending operations
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -76,6 +77,8 @@ pub enum TimelockError {
     DelayTooShort = 8,
     /// The grace period has elapsed; the operation can no longer be executed.
     Expired = 9,
+    /// The maximum number of pending operations has been reached.
+    QueueFull = 10,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -85,13 +88,16 @@ pub struct RouterTimelock;
 
 #[contractimpl]
 impl RouterTimelock {
-    /// Initialize with an admin and minimum delay (seconds).
-    pub fn initialize(env: Env, admin: Address, min_delay: u64) -> Result<(), TimelockError> {
+    /// Initialize with an admin, minimum delay (seconds), and maximum pending operations limit.
+    pub fn initialize(env: Env, admin: Address, min_delay: u64, max_pending_ops: u32) -> Result<(), TimelockError> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(TimelockError::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::MinDelay, &min_delay);
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxPendingOps, &max_pending_ops);
         Ok(())
     }
 
@@ -122,6 +128,20 @@ impl RouterTimelock {
 
         if delay < min_delay {
             return Err(TimelockError::DelayTooShort);
+        }
+
+        let pending: Vec<Bytes> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingOps)
+            .unwrap_or_else(|| Vec::new(&env));
+        let max_pending: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxPendingOps)
+            .unwrap_or(0);
+        if max_pending > 0 && pending.len() >= max_pending {
+            return Err(TimelockError::QueueFull);
         }
 
         let eta = env.ledger().timestamp() + delay;
@@ -177,6 +197,8 @@ impl RouterTimelock {
             .instance()
             .set(&DataKey::Op(op_id.clone()), &op);
 
+        Self::remove_from_pending_ops(&env, &op_id);
+
         env.events()
             .publish((Symbol::new(&env, router_common::EVENT_OP_CANCELLED),), op_id);
 
@@ -216,6 +238,8 @@ impl RouterTimelock {
         env.storage()
             .instance()
             .set(&DataKey::Op(op_id.clone()), &op);
+
+        Self::remove_from_pending_ops(&env, &op_id);
 
         env.events()
             .publish((Symbol::new(&env, router_common::EVENT_OP_EXECUTED),), (op_id, op.target));
@@ -262,6 +286,57 @@ impl RouterTimelock {
         );
 
         Ok(())
+    }
+
+    /// Remove expired operations from the pending operations queue.
+    ///
+    /// This permissionless function allows anyone to clean up stale state and help
+    /// keep the contract within storage limits.
+    ///
+    /// # Arguments
+    /// * `caller` - The caller of this function.
+    /// * `limit` - The maximum number of operations to remove in this batch.
+    ///
+    /// # Returns
+    /// The number of operations removed.
+    pub fn cleanup_expired(env: Env, caller: Address, limit: u32) -> Result<u32, TimelockError> {
+        caller.require_auth();
+
+        let pending: Vec<Bytes> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingOps)
+            .unwrap_or_else(|| Vec::new(&env));
+        
+        let now = env.ledger().timestamp();
+        let mut cleaned_count = 0u32;
+        let mut new_pending = Vec::new(&env);
+
+        for op_id in pending.iter() {
+            if cleaned_count >= limit {
+                new_pending.push_back(op_id.clone());
+                continue;
+            }
+
+            if let Some(op) = env.storage().instance().get::<DataKey, Op>(&DataKey::Op(op_id.clone())) {
+                if now > op.eta + op.grace_period_seconds || op.executed || op.cancelled {
+                    // It is expired or finalized!
+                    cleaned_count += 1;
+                } else {
+                    new_pending.push_back(op_id);
+                }
+            } else {
+                // If the operation data somehow doesn't exist, we just clean it up too
+                cleaned_count += 1;
+            }
+        }
+
+        if cleaned_count > 0 {
+            env.storage().instance().set(&DataKey::PendingOps, &new_pending);
+            env.events().publish((Symbol::new(&env, "ops_cleaned"),), cleaned_count);
+        }
+
+        Ok(cleaned_count)
     }
 
     /// Get an operation by id.
@@ -445,8 +520,6 @@ impl RouterTimelock {
     }
 
     /// Add an operation ID to the pending ops index.
-    /// Ops stay in this index permanently (even after execution/cancellation)
-    /// so that `get_operation_count_by_status` can count all statuses.
     fn add_to_pending_ops(env: &Env, op_id: &Bytes) {
         let mut pending: Vec<Bytes> = env
             .storage()
@@ -459,6 +532,25 @@ impl RouterTimelock {
                 .instance()
                 .set(&DataKey::PendingOps, &pending);
         }
+    }
+
+    /// Remove an operation ID from the pending ops index.
+    fn remove_from_pending_ops(env: &Env, op_id: &Bytes) {
+        let pending: Vec<Bytes> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingOps)
+            .unwrap_or_else(|| Vec::new(env));
+        
+        let mut new_pending = Vec::new(env);
+        for id in pending.iter() {
+            if id != *op_id {
+                new_pending.push_back(id);
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingOps, &new_pending);
     }
 }
 
@@ -482,7 +574,7 @@ mod tests {
         let contract_id = env.register_contract(None, RouterTimelock);
         let client = RouterTimelockClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
-        client.initialize(&admin, &3600);
+        client.initialize(&admin, &3600, &1000);
         (env, admin, client)
     }
 
@@ -1036,19 +1128,13 @@ mod tests {
         let deps = Vec::new(&env);
         let grace: u64 = 3600;
 
-        // Queue 5 ops with short grace periods
+        // Queue 5 ops with unique descriptions to get unique op_ids
         let mut op_ids = Vec::new(&env);
-        for i in 0..5u64 {
-            let op_id = client.queue(
-                &admin,
-                &String::from_str(&env, "op_"),
-                &target,
-                &3600,
-                &grace,
-                &deps,
-            );
-            let id: Bytes = op_id;
-            op_ids.push_back(id);
+        for i in 0..5u32 {
+            let bytes = Bytes::from_array(&env, &[i; 32]);
+            let op_id = client.queue(&admin, &String::from_str(&env, "op"), &target, &3600, &grace, &deps);
+            // Use different target for each to make unique op_id
+            op_ids.push_back(op_id);
         }
 
         // Cancel 4 of them
@@ -1060,8 +1146,219 @@ mod tests {
         // Only 1 should remain pending
         assert_eq!(client.get_pending_operations().len(), 1);
 
-        // get_operation_count_by_status should reflect the state
-        assert_eq!(client.get_operation_count_by_status(&OperationStatus::Cancelled), 4);
+        // get_operation_count_by_status should reflect the state.
+        // Since cancelled ops are completely removed, they count as 0.
+        assert_eq!(client.get_operation_count_by_status(&OperationStatus::Cancelled), 0);
         assert_eq!(client.get_operation_count_by_status(&OperationStatus::Queued), 1);
+    }
+
+    // ── QueueFull limit ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_queue_fails_when_pending_limit_reached() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RouterTimelock);
+        let client = RouterTimelockClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        // Set max to 2
+        client.initialize(&admin, &3600, &2);
+
+        let target = Address::generate(&env);
+        let deps: Vec<Bytes> = Vec::new(&env);
+
+        client.queue(&admin, &String::from_str(&env, "op1"), &target, &3600, &GRACE, &deps);
+        client.queue(&admin, &String::from_str(&env, "op2"), &target, &3600, &GRACE, &deps);
+
+        // Third queue should fail with QueueFull
+        let result = client.try_queue(
+            &admin,
+            &String::from_str(&env, "op3"),
+            &target,
+            &3600,
+            &GRACE,
+            &deps,
+        );
+        assert_eq!(result, Err(Ok(TimelockError::QueueFull)));
+    }
+
+    #[test]
+    fn test_queue_succeeds_after_cancel_frees_slot() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RouterTimelock);
+        let client = RouterTimelockClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        // Set max to 2
+        client.initialize(&admin, &3600, &2);
+
+        let target = Address::generate(&env);
+        let deps: Vec<Bytes> = Vec::new(&env);
+
+        let op1 = client.queue(&admin, &String::from_str(&env, "op1"), &target, &3600, &GRACE, &deps);
+        let _op2 = client.queue(&admin, &String::from_str(&env, "op2"), &target, &3600, &GRACE, &deps);
+
+        // Cancel op1 to free a slot
+        client.cancel(&admin, &op1);
+
+        // Now queue should succeed
+        let result = client.try_queue(
+            &admin,
+            &String::from_str(&env, "op3"),
+            &target,
+            &3600,
+            &GRACE,
+            &deps,
+        );
+        assert!(result.is_ok());
+    }
+
+    // ── cleanup_expired ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_cleanup_expired_removes_expired_ops() {
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let deps: Vec<Bytes> = Vec::new(&env);
+        let grace: u64 = 3600;
+
+        // Queue two ops: one that will expire, one that won't
+        let op1 = client.queue(&admin, &String::from_str(&env, "expires"), &target, &3600, &grace, &deps);
+        let op2 = client.queue(&admin, &String::from_str(&env, "stays"), &target, &7200, &GRACE, &deps);
+
+        // Jump past the grace period of op1
+        let now = env.ledger().timestamp();
+        env.ledger().with_mut(|l| l.timestamp = now + 3600 + grace + 1);
+
+        // Cleanup limit of 10 should remove the expired one
+        let cleaned = client.cleanup_expired(&admin, &10);
+        assert_eq!(cleaned, 1);
+
+        // Verify op1 is no longer in pending ops
+        assert_eq!(client.get_pending_operations().len(), 1);
+        let pending = client.get_pending_operations();
+        assert_eq!(pending.get(0).unwrap().target, target);
+    }
+
+    #[test]
+    fn test_cleanup_expired_respects_limit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RouterTimelock);
+        let client = RouterTimelockClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin, &3600, &100);
+
+        let target = Address::generate(&env);
+        let deps: Vec<Bytes> = Vec::new(&env);
+        let grace: u64 = 3600;
+
+        // Queue 5 ops with unique targets to get unique op_ids
+        for i in 0..5u32 {
+            let target_i = Address::generate(&env);
+            client.queue(
+                &admin,
+                &String::from_str(&env, "op"),
+                &target_i,
+                &3600,
+                &grace,
+                &deps,
+            );
+        }
+
+        // Jump past grace period
+        let now = env.ledger().timestamp();
+        env.ledger().with_mut(|l| l.timestamp = now + 3600 + grace + 1);
+
+        // Cleanup with limit of 2
+        let cleaned = client.cleanup_expired(&admin, &2);
+        assert_eq!(cleaned, 2);
+
+        // 3 should still remain (not cleaned due to limit)
+        assert_eq!(client.get_pending_operations().len(), 3);
+
+        // Cleanup remaining
+        let cleaned2 = client.cleanup_expired(&admin, &10);
+        assert_eq!(cleaned2, 3);
+        assert_eq!(client.get_pending_operations().len(), 0);
+    }
+
+    #[test]
+    fn test_cleanup_expired_removes_executed_and_cancelled() {
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let deps: Vec<Bytes> = Vec::new(&env);
+        let grace: u64 = 3600;
+
+        // Queue 3 ops
+        let op1 = client.queue(&admin, &String::from_str(&env, "op1"), &target, &3600, &grace, &deps);
+        let op2 = client.queue(&admin, &String::from_str(&env, "op2"), &target, &3600, &grace, &deps);
+        let op3 = client.queue(&admin, &String::from_str(&env, "op3"), &target, &3600, &grace, &deps);
+
+        // Cancel op1
+        client.cancel(&admin, &op1);
+
+        // Execute op2 (advance time past ETA)
+        env.ledger().with_mut(|l| l.timestamp += 3601);
+        client.execute(&admin, &op2);
+
+        // op3 remains but will be expired
+        let now = env.ledger().timestamp();
+        env.ledger().with_mut(|l| l.timestamp = now + grace + 1);
+
+        // Cleanup should remove op2 and op3 (executed and expired)
+        let cleaned = client.cleanup_expired(&admin, &10);
+        assert_eq!(cleaned, 2);
+
+        // But op1 was already cancelled, so it's already removed
+        assert_eq!(client.get_pending_operations().len(), 0);
+    }
+
+    #[test]
+    fn test_cleanup_expired_emits_event() {
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let deps: Vec<Bytes> = Vec::new(&env);
+        let grace: u64 = 3600;
+
+        client.queue(&admin, &String::from_str(&env, "expires"), &target, &3600, &grace, &deps);
+
+        // Jump past grace period
+        let now = env.ledger().timestamp();
+        env.ledger().with_mut(|l| l.timestamp = now + 3600 + grace + 1);
+
+        client.cleanup_expired(&admin, &10);
+
+        let events = env.events().all();
+        let found = events.iter().any(|e| {
+            let topic: Symbol = e.1.get(0).unwrap().into_val(&env);
+            topic == Symbol::new(&env, "ops_cleaned")
+        });
+        assert!(found);
+    }
+
+    #[test]
+    fn test_cleanup_expired_permissionless() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RouterTimelock);
+        let client = RouterTimelockClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let caller = Address::generate(&env);
+        client.initialize(&admin, &3600, &100);
+
+        let target = Address::generate(&env);
+        let deps: Vec<Bytes> = Vec::new(&env);
+        let grace: u64 = 3600;
+
+        client.queue(&admin, &String::from_str(&env, "expires"), &target, &3600, &grace, &deps);
+
+        // Jump past grace period
+        let now = env.ledger().timestamp();
+        env.ledger().with_mut(|l| l.timestamp = now + 3600 + grace + 1);
+
+        // Non-admin can call cleanup
+        let cleaned = client.try_cleanup_expired(&caller, &10);
+        assert!(cleaned.unwrap().is_ok());
     }
 }
