@@ -434,7 +434,7 @@ impl RouterMiddleware {
                         }
                         RateLimitStrategy::Throttle => {
                             env.events().publish(
-                                (Symbol::new(&env, "rate_limit_throttled"),),
+                                (Symbol::new(&env, router_common::EVENT_RATE_LIMIT_THROTTLED),),
                                 (caller.clone(), route.clone()),
                             );
                             state_changed = true;
@@ -442,7 +442,7 @@ impl RouterMiddleware {
                         }
                         RateLimitStrategy::LogOnly => {
                             env.events().publish(
-                                (Symbol::new(&env, "rate_limit_exceeded"),),
+                                (Symbol::new(&env, router_common::EVENT_RATE_LIMIT_EXCEEDED),),
                                 (caller.clone(), route.clone()),
                             );
                             state_changed = true;
@@ -450,14 +450,16 @@ impl RouterMiddleware {
                         }
                     }
                 } else {
-                    caller.clone(),
-                    RateLimitState {
-                        calls_in_window: calls + 1,
-                        window_start,
-                        total_violations: state.total_violations,
-                    },
-                );
-                state_changed = true;
+                    route_call_state.rate_limits.set(
+                        caller.clone(),
+                        RateLimitState {
+                            calls_in_window: calls + 1,
+                            window_start,
+                            total_violations: state.total_violations,
+                        },
+                    );
+                    state_changed = true;
+                }
             }
 
             if state_changed {
@@ -677,7 +679,7 @@ impl RouterMiddleware {
                         route_call_state.circuit_breaker.failure_count = 0;
                         route_call_state.circuit_breaker.opened_at = 0;
                         env.events().publish(
-                            (Symbol::new(&env, "circuit_closed"),),
+                            (Symbol::new(&env, router_common::EVENT_CIRCUIT_CLOSED),),
                             route.clone(),
                         );
                     } else if !route_call_state.circuit_breaker.is_open
@@ -722,7 +724,7 @@ impl RouterMiddleware {
             .instance()
             .set(&DataKey::GlobalEnabled, &enabled);
         env.events()
-            .publish((Symbol::new(&env, "middleware_enabled"),), enabled);
+            .publish((Symbol::new(&env, router_common::EVENT_MIDDLEWARE_ENABLED),), enabled);
         Ok(())
     }
 
@@ -1353,7 +1355,7 @@ mod tests {
     use super::*;
     use soroban_sdk::{
         testutils::{Address as _, Events, Ledger},
-        Env, IntoVal, String,
+        Env, FromVal, IntoVal, String,
     };
 
     fn setup() -> (Env, Address, RouterMiddlewareClient<'static>) {
@@ -2055,7 +2057,7 @@ mod tests {
         let events = env.events().all();
         let last = events.last().unwrap();
         let topic: Symbol = last.1.get(0).unwrap().into_val(&env);
-        assert_eq!(topic, Symbol::new(&env, "middleware_enabled"));
+        assert_eq!(topic, Symbol::new(&env, router_common::EVENT_MIDDLEWARE_ENABLED));
         let emitted: bool = last.2.into_val(&env);
         assert!(!emitted);
     }
@@ -2370,7 +2372,7 @@ mod tests {
             e.1.get(0)
                 .map(|v| {
                     let s: Symbol = v.into_val(&env);
-                    s == Symbol::new(&env, "circuit_closed")
+                    s == Symbol::new(&env, router_common::EVENT_CIRCUIT_CLOSED)
                 })
                 .unwrap_or(false)
         });
@@ -2481,7 +2483,7 @@ mod tests {
             topics
                 .get(0)
                 .map(|v| {
-                    Symbol::from_val(&env, &v) == Symbol::new(&env, "rate_limit_throttled")
+                    Symbol::from_val(&env, &v) == Symbol::new(&env, router_common::EVENT_RATE_LIMIT_THROTTLED)
                 })
                 .unwrap_or(false)
         });
@@ -2523,7 +2525,7 @@ mod tests {
             topics
                 .get(0)
                 .map(|v| {
-                    Symbol::from_val(&env, &v) == Symbol::new(&env, "rate_limit_exceeded")
+                    Symbol::from_val(&env, &v) == Symbol::new(&env, router_common::EVENT_RATE_LIMIT_EXCEEDED)
                 })
                 .unwrap_or(false)
         });
@@ -2580,6 +2582,8 @@ mod tests {
         let last = events.last().unwrap();
         let topic: Symbol = last.1.get(0).unwrap().into_val(&env);
         assert_eq!(topic, Symbol::new(&env, "rate_limit_strategy_set"));
+    }
+
     // ── Issue #593: rate-limit window tests under ledger timestamp jumps ──────
 
     #[test]
