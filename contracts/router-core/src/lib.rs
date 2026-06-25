@@ -393,7 +393,7 @@ impl RouterCore {
         Self::recompute_best_route(&env);
 
         env.events()
-            .publish((Symbol::new(&env, "route_removed"),), name.clone());
+            .publish((Symbol::new(&env, router_common::EVENT_ROUTE_REMOVED),), name.clone());
 
         Ok(())
     }
@@ -672,7 +672,7 @@ impl RouterCore {
             .set(&DataKey::Route(name.clone()), &entry);
 
         env.events()
-            .publish((Symbol::new(&env, "route_paused"),), (name.clone(), paused));
+            .publish((Symbol::new(&env, router_common::EVENT_ROUTE_PAUSED),), (name.clone(), paused));
 
         // Pause state affects best-route eligibility; refresh the cache.
         Self::recompute_best_route(&env);
@@ -703,7 +703,7 @@ impl RouterCore {
         env.storage().instance().set(&DataKey::Paused, &paused);
 
         env.events()
-            .publish((Symbol::new(&env, "router_paused"),), paused);
+            .publish((Symbol::new(&env, router_common::EVENT_ROUTER_PAUSED),), paused);
 
         Ok(())
     }
@@ -857,7 +857,7 @@ impl RouterCore {
                 .set(&DataKey::Metadata(name.clone()), &metadata);
 
             env.events()
-                .publish((Symbol::new(&env, "route_tag_added"),), (name, tag));
+                .publish((Symbol::new(&env, router_common::EVENT_ROUTE_TAG_ADDED),), (name, tag));
         }
 
         Ok(())
@@ -903,7 +903,7 @@ impl RouterCore {
                     .set(&DataKey::Metadata(name.clone()), &metadata);
 
                 env.events()
-                    .publish((Symbol::new(&env, "route_tag_removed"),), (name, tag));
+                    .publish((Symbol::new(&env, router_common::EVENT_ROUTE_TAG_REMOVED),), (name, tag));
             }
         }
 
@@ -1066,7 +1066,7 @@ impl RouterCore {
             .set(&DataKey::Aliases, &updated_aliases);
 
         env.events()
-            .publish((Symbol::new(&env, "alias_removed"),), alias_name);
+            .publish((Symbol::new(&env, router_common::EVENT_ALIAS_REMOVED),), alias_name);
 
         Ok(())
     }
@@ -1597,7 +1597,7 @@ impl RouterCore {
             .set(&DataKey::Aliases, &updated_aliases);
 
         env.events()
-            .publish((Symbol::new(env, "route_removed"),), name);
+            .publish((Symbol::new(env, router_common::EVENT_ROUTE_REMOVED),), name);
 
         Ok(())
     }

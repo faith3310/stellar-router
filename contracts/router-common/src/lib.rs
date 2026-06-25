@@ -69,6 +69,24 @@ pub const EVENT_METADATA_UPDATED: &str = "metadata_updated";
 /// Standard event topic for alias additions
 pub const EVENT_ALIAS_ADDED: &str = "alias_added";
 
+/// Standard event topic for alias removals
+pub const EVENT_ALIAS_REMOVED: &str = "alias_removed";
+
+/// Standard event topic for route removals
+pub const EVENT_ROUTE_REMOVED: &str = "route_removed";
+
+/// Standard event topic for route pause state changes
+pub const EVENT_ROUTE_PAUSED: &str = "route_paused";
+
+/// Standard event topic for router global pause state changes
+pub const EVENT_ROUTER_PAUSED: &str = "router_paused";
+
+/// Standard event topic for route tag additions
+pub const EVENT_ROUTE_TAG_ADDED: &str = "route_tag_added";
+
+/// Standard event topic for route tag removals
+pub const EVENT_ROUTE_TAG_REMOVED: &str = "route_tag_removed";
+
 /// Standard event topic for role grants
 pub const EVENT_ROLE_GRANTED: &str = "role_granted";
 
@@ -111,6 +129,18 @@ pub const EVENT_POST_CALL: &str = "post_call";
 /// Standard event topic for circuit breaker opening
 pub const EVENT_CIRCUIT_OPENED: &str = "circuit_opened";
 
+/// Standard event topic for circuit breaker closing
+pub const EVENT_CIRCUIT_CLOSED: &str = "circuit_closed";
+
+/// Standard event topic for middleware enable/disable
+pub const EVENT_MIDDLEWARE_ENABLED: &str = "middleware_enabled";
+
+/// Standard event topic for rate limit throttling
+pub const EVENT_RATE_LIMIT_THROTTLED: &str = "rate_limit_throttled";
+
+/// Standard event topic for rate limit exceeded
+pub const EVENT_RATE_LIMIT_EXCEEDED: &str = "rate_limit_exceeded";
+
 /// Standard event topic for call log clearing
 pub const EVENT_CALL_LOG_CLEARED: &str = "call_log_cleared";
 
@@ -120,11 +150,23 @@ pub const EVENT_CALL_RESULT: &str = "call_result";
 /// Standard event topic for a required call failure in multicall (includes index + contract context)
 pub const EVENT_CALL_FAILED: &str = "call_failed";
 
+/// Standard event topic for batch execution completion
+pub const EVENT_BATCH_EXECUTED: &str = "batch_executed";
+
 /// Standard event topic for max batch size updates
 pub const EVENT_MAX_BATCH_SIZE_UPDATED: &str = "max_batch_size_updated";
 
 /// Standard event topic for timelock operation queueing
 pub const EVENT_OP_QUEUED: &str = "op_queued";
+
+/// Standard event topic for timelock operation execution
+pub const EVENT_OP_EXECUTED: &str = "op_executed";
+
+/// Standard event topic for timelock operation cancellation
+pub const EVENT_OP_CANCELLED: &str = "op_cancelled";
+
+/// Standard event topic for timelock operation description updates
+pub const EVENT_OP_DESCRIPTION_UPDATED: &str = "op_description_updated";
 
 /// Standard event topic for contract registration in registry
 pub const EVENT_CONTRACT_REGISTERED: &str = "contract_registered";

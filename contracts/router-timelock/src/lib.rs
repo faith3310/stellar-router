@@ -152,7 +152,7 @@ impl RouterTimelock {
         Self::add_to_pending_ops(&env, &op_id);
 
         env.events().publish(
-            (Symbol::new(&env, "op_queued"),),
+            (Symbol::new(&env, router_common::EVENT_OP_QUEUED),),
             (op_id.clone(), target, eta, grace_period_seconds),
         );
 
@@ -178,7 +178,7 @@ impl RouterTimelock {
             .set(&DataKey::Op(op_id.clone()), &op);
 
         env.events()
-            .publish((Symbol::new(&env, "op_cancelled"),), op_id);
+            .publish((Symbol::new(&env, router_common::EVENT_OP_CANCELLED),), op_id);
 
         Ok(())
     }
@@ -218,7 +218,7 @@ impl RouterTimelock {
             .set(&DataKey::Op(op_id.clone()), &op);
 
         env.events()
-            .publish((Symbol::new(&env, "op_executed"),), (op_id, op.target));
+            .publish((Symbol::new(&env, router_common::EVENT_OP_EXECUTED),), (op_id, op.target));
 
         Ok(())
     }
@@ -257,7 +257,7 @@ impl RouterTimelock {
             .set(&DataKey::Op(op_id.clone()), &op);
 
         env.events().publish(
-            (Symbol::new(&env, "op_description_updated"),),
+            (Symbol::new(&env, router_common::EVENT_OP_DESCRIPTION_UPDATED),),
             (op_id, new_description),
         );
 
@@ -511,7 +511,7 @@ mod tests {
         let last = events.last().unwrap();
 
         let topic: Symbol = last.1.get(0).unwrap().into_val(&env);
-        assert_eq!(topic, Symbol::new(&env, "op_queued"));
+        assert_eq!(topic, Symbol::new(&env, router_common::EVENT_OP_QUEUED));
 
         let (emitted_id, emitted_target, emitted_eta, emitted_grace): (Bytes, Address, u64, u64) =
             last.2.into_val(&env);
@@ -655,7 +655,7 @@ mod tests {
         let events = env.events().all();
         let last = events.last().unwrap();
         let topic: Symbol = last.1.get(0).unwrap().into_val(&env);
-        assert_eq!(topic, Symbol::new(&env, "op_executed"));
+        assert_eq!(topic, Symbol::new(&env, router_common::EVENT_OP_EXECUTED));
     }
 
     // ── cancel ────────────────────────────────────────────────────────────────
@@ -687,7 +687,7 @@ mod tests {
         let events = env.events().all();
         let last = events.last().unwrap();
         let topic: Symbol = last.1.get(0).unwrap().into_val(&env);
-        assert_eq!(topic, Symbol::new(&env, "op_cancelled"));
+        assert_eq!(topic, Symbol::new(&env, router_common::EVENT_OP_CANCELLED));
     }
 
     // ── validation ────────────────────────────────────────────────────────────
@@ -812,7 +812,7 @@ mod tests {
         let last = events.last().unwrap();
 
         let topic: Symbol = last.1.get(0).unwrap().into_val(&env);
-        assert_eq!(topic, Symbol::new(&env, "op_description_updated"));
+        assert_eq!(topic, Symbol::new(&env, router_common::EVENT_OP_DESCRIPTION_UPDATED));
 
         let (emitted_id, emitted_desc): (Bytes, String) = last.2.into_val(&env);
         assert_eq!(emitted_id, op_id);
