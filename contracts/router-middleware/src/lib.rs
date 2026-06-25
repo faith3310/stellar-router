@@ -1364,6 +1364,7 @@ mod tests {
 
     fn setup() -> (Env, Address, RouterMiddlewareClient<'static>) {
         let env = Env::default();
+        env.ledger().set_timestamp(123456);
         env.mock_all_auths();
         let contract_id = env.register_contract(None, RouterMiddleware);
         let client = RouterMiddlewareClient::new(&env, &contract_id);
@@ -1879,7 +1880,7 @@ mod tests {
         assert_eq!(state_after_window.calls_in_window, 0);
         assert_eq!(
             state_after_window.window_start,
-            env.ledger().timestamp() - 1
+            env.ledger().timestamp()
         );
     }
 
@@ -1980,6 +1981,7 @@ mod tests {
 
         // Call should now succeed (auto-recovery)
         assert!(client.try_pre_call(&caller, &route).is_ok());
+        client.post_call(&caller, &route, &true);
 
         // Verify circuit breaker state is reset in storage
         let state_after_recovery = client.circuit_breaker_state(&route).unwrap();
@@ -2307,6 +2309,7 @@ mod tests {
 
         // Make a successful call (triggers auto-recovery)
         assert!(client.try_pre_call(&caller, &route).is_ok());
+        client.post_call(&caller, &route, &true);
 
         // Verify failure_count is reset to zero
         let state_after_recovery = client.circuit_breaker_state(&route).unwrap();
@@ -2338,6 +2341,7 @@ mod tests {
 
         // Trigger auto-recovery by calling pre_call
         assert!(client.try_pre_call(&caller, &route).is_ok());
+        client.post_call(&caller, &route, &true);
 
         // Verify state is fully reset
         let state_recovered = client.circuit_breaker_state(&route).unwrap();

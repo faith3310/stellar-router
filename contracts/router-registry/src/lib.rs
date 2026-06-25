@@ -323,8 +323,6 @@ impl RouterRegistry {
         }
 
         let constraint_str = constraint.unwrap();
-        let mut matched_constraint = false;
-
         if versions.is_empty() {
             return Err(RegistryError::NotFound);
         }
@@ -343,7 +341,7 @@ impl RouterRegistry {
                 .get(&DataKey::Entry(name.clone(), v))
                 .ok_or(RegistryError::NotFound)?;
             if Self::version_matches_constraint(v, &constraint_str)? {
-                matched_constraint = true;
+                any_constraint_match = true;
             } else {
                 continue;
             }

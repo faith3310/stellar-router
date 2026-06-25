@@ -1039,9 +1039,11 @@ mod tests {
         // Queue 5 ops with short grace periods
         let mut op_ids = Vec::new(&env);
         for i in 0..5u64 {
+            let desc_str = std::format!("op_{}", i);
+            let desc = String::from_str(&env, &desc_str);
             let op_id = client.queue(
                 &admin,
-                &String::from_str(&env, "op_"),
+                &desc,
                 &target,
                 &3600,
                 &grace,
