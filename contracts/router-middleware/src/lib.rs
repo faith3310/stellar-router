@@ -20,6 +20,10 @@
 //! - `call_log_cleared` — Call log cleared for route
 //! - `admin_transferred` — Admin transferred to new address
 
+pub mod call_log;
+pub mod circuit_breaker;
+pub mod rate_limit;
+
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, Map, String, Symbol, Vec,
 };

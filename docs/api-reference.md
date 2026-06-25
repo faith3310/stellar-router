@@ -491,6 +491,84 @@ Returns the middleware config for `route`.
 
 ---
 
+### Rate Limiting Algorithm
+
+#### How It Works
+
+The rate limiter uses a **fixed-window counter** per `(route, caller)` pair.
+Each caller has its own independent window — windows are not shared or aligned
+across callers.
+
+**Window lifecycle:**
+
+1. On the first call, `window_start` is set to the current ledger timestamp
+   and `calls_in_window` is set to 1.
+2. Subsequent calls within the same window increment `calls_in_window`.
+3. When `calls_in_window >= max_calls_per_window`, `pre_call` returns
+   `RateLimitExceeded` and increments `total_violations` without counting
+   the call.
+4. On the first call after `window_start + window_seconds` has elapsed, the
+   window resets: `window_start = now`, `calls_in_window = 1`.
+
+The check in `pre_call`:
+```
+window_elapsed = now >= window_start + window_seconds
+calls           = 0               if window_elapsed else calls_in_window
+window_start    = now             if window_elapsed else window_start
+```
+
+#### Ledger Timestamp Granularity
+
+Stellar closes a ledger approximately every **5 seconds**. All calls within
+the same ledger closure share the same `env.ledger().timestamp()` value. This
+means:
+
+- A `window_seconds = 60` window allows all calls within the same 5-second
+  ledger to be counted as a single moment. Setting `max_calls_per_window = 10`
+  does **not** prevent 10 calls in the same ledger.
+- For burst protection, set `window_seconds` smaller than 1 ledger close time
+  only if you want to block multiple calls per ledger (they will all see the
+  same `now` and the first call sets the window, subsequent ones within the
+  same ledger see `window_elapsed = false`).
+
+#### Tuning Guidelines
+
+| Traffic pattern | Suggested config | Notes |
+|---|---|---|
+| Low-traffic route | `max_calls=10, window_secs=60` | 10 calls per minute per caller |
+| High-traffic route | `max_calls=1000, window_secs=300` | 1000 calls per 5 minutes per caller |
+| Burst protection | `max_calls=5, window_secs=5` | 5 calls per 5-second ledger window |
+| Effectively unlimited | `max_calls_per_window=0` | Rate limiting disabled for route |
+
+**Short window + low count** vs **long window + high count:**
+
+- Short windows (e.g., 5s / 5 calls) aggressively block bursts but reset
+  quickly, allowing another burst immediately after.
+- Long windows (e.g., 3600s / 100 calls) smooth traffic over time but a
+  burst at window-start consumes all capacity until the window expires.
+
+Choose based on whether you need burst suppression (short) or sustained
+throughput limiting (long).
+
+#### Gotchas
+
+- **Windows are not aligned across routes or callers.** Each `(route, caller)`
+  window starts independently on first call, so two callers can be in different
+  phases of their windows simultaneously.
+- **A network halt extends the effective window.** If the Stellar network
+  halts for 10 minutes, `now` jumps forward by the halt duration when it
+  resumes. Any caller whose window had not yet expired will suddenly find
+  their window expired, resetting the counter immediately on the next call.
+- **Changing `max_calls` takes effect immediately without resetting counters.**
+  If you lower `max_calls_per_window` from 100 to 10 and a caller has already
+  made 15 calls in the current window, they will be blocked until the window
+  expires — even though those calls were made under the old config.
+- **`window_seconds = 0` with `max_calls_per_window > 0` is rejected** by
+  `configure_route` with `InvalidConfig`. Set `max_calls_per_window = 0` to
+  disable rate limiting entirely.
+
+---
+
 ## router-timelock
 
 **Contract:** `RouterTimelock`  
