@@ -4169,6 +4169,67 @@ mod tests {
         assert_eq!(common_count, 1, "common_tag should appear exactly once");
     }
 
+    // ── Issue #631: get_routes_by_tag O(n²) complexity ──────────────────────
+
+    #[test]
+    fn test_get_routes_by_tag_with_many_routes() {
+        // Test that get_routes_by_tag correctly returns matching routes
+        // when many routes and tags exist in the system.
+        let (env, admin, client) = setup();
+        let addr = Address::generate(&env);
+        let tag_defi = String::from_str(&env, "defi");
+        let tag_stable = String::from_str(&env, "stable");
+
+        // Register many routes with overlapping tags
+        for i in 0u32..5 {
+            let route_name = String::from_str(&env, &format!("route-{}", i));
+            let mut tags = vec![&env, tag_defi.clone()];
+            if i % 2 == 0 {
+                tags.push_back(tag_stable.clone());
+            }
+            client.register_route(
+                &admin,
+                &route_name,
+                &addr,
+                &Some(RouteMetadata {
+                    description: String::from_str(&env, "Test route"),
+                    tags,
+                    owner: admin.clone(),
+                }),
+            );
+        }
+
+        // All 5 routes have "defi" tag
+        let defi_routes = client.get_routes_by_tag(&tag_defi);
+        assert_eq!(defi_routes.len(), 5);
+
+        // Only even-indexed routes (0, 2, 4) have "stable" tag
+        let stable_routes = client.get_routes_by_tag(&tag_stable);
+        assert_eq!(stable_routes.len(), 3);
+    }
+
+    #[test]
+    fn test_get_routes_by_tag_empty_tag_returns_no_routes() {
+        let (env, admin, client) = setup();
+        let addr = Address::generate(&env);
+        let existing_tag = String::from_str(&env, "existing");
+        let missing_tag = String::from_str(&env, "missing");
+
+        client.register_route(
+            &admin,
+            &String::from_str(&env, "route-a"),
+            &addr,
+            &Some(RouteMetadata {
+                description: String::from_str(&env, "Test"),
+                tags: vec![&env, existing_tag],
+                owner: admin.clone(),
+            }),
+        );
+
+        let missing_routes = client.get_routes_by_tag(&missing_tag);
+        assert_eq!(missing_routes.len(), 0);
+    }
+
     #[test]
     fn test_route_tag_writes_require_admin_and_existing_route() {
         let (env, admin, client) = setup();
