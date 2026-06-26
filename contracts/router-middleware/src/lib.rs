@@ -604,6 +604,7 @@ impl RouterMiddleware {
             .get(&DataKey::TotalCalls)
             .unwrap_or(0)
     }
+
     /// Get the call log for a route.
     ///
     /// Returns the list of recent call log entries for `route`, up to the
@@ -641,11 +642,8 @@ impl RouterMiddleware {
 
     /// Get the number of call log entries for a route.
     ///
-    /// More efficient than loading the full call log when callers only need
-    /// the current retained length.
     /// Returns the number of call log entries stored for a route.
-    ///
-    /// More efficient than get_call_log(route).len() as it avoids loading all entries.
+    /// More efficient than `get_call_log(route).len()` as it avoids loading all entries.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment.
