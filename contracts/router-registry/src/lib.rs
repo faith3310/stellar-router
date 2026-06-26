@@ -323,8 +323,6 @@ impl RouterRegistry {
         }
 
         let constraint_str = constraint.unwrap();
-        let mut matched_constraint = false;
-
         if versions.is_empty() {
             return Err(RegistryError::NotFound);
         }
@@ -343,7 +341,7 @@ impl RouterRegistry {
                 .get(&DataKey::Entry(name.clone(), v))
                 .ok_or(RegistryError::NotFound)?;
             if Self::version_matches_constraint(v, &constraint_str)? {
-                matched_constraint = true;
+                any_constraint_match = true;
             } else {
                 continue;
             }
@@ -391,7 +389,12 @@ impl RouterRegistry {
         Self::deprecate_one(&env, name, version, reason)
     }
 
-    fn deprecate_one(env: &Env, name: String, version: u32, reason: Option<String>) -> Result<(), RegistryError> {
+    fn deprecate_one(
+        env: &Env,
+        name: String,
+        version: u32,
+        reason: Option<String>,
+    ) -> Result<(), RegistryError> {
         let mut entry: ContractEntry = env
             .storage()
             .instance()
@@ -477,15 +480,18 @@ impl RouterRegistry {
     ///
     /// # Panics
     /// * Panics if the contract has not been initialized.
-    /// 
+    ///
     /// Note: This is a breaking change from the previous Result-based API.
     /// Calling admin() on an uninitialized contract is considered a programming error
     /// rather than a runtime condition, consistent with how similar getters work.
     pub fn admin(env: Env) -> Address {
+    /// # Errors
+    /// * [`RegistryError::NotInitialized`] — if the contract has not been initialized.
+    pub fn admin(env: Env) -> Result<Address, RegistryError> {
         env.storage()
             .instance()
             .get(&DataKey::Admin)
-            .expect("not initialized")
+            .ok_or(RegistryError::NotInitialized)
     }
 
     /// Get all registered versions for a name.
@@ -563,9 +569,7 @@ impl RouterRegistry {
             .storage()
             .instance()
             .get::<DataKey, (String, u32)>(&DataKey::AddressIndex(address))?;
-        env.storage()
-            .instance()
-            .get(&DataKey::Entry(name, version))
+        env.storage().instance().get(&DataKey::Entry(name, version))
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -586,11 +590,7 @@ impl RouterRegistry {
         }
     }
 
-    fn validate_registration(
-        env: &Env,
-        name: &String,
-        version: u32,
-    ) -> Result<(), RegistryError> {
+    fn validate_registration(env: &Env, name: &String, version: u32) -> Result<(), RegistryError> {
         if version == 0 {
             return Err(RegistryError::InvalidVersion);
         }
@@ -661,7 +661,7 @@ impl RouterRegistry {
     }
 
     fn require_admin(env: &Env, caller: &Address) -> Result<(), RegistryError> {
-        let admin = Self::admin(env.clone());
+        let admin = Self::admin(env.clone())?;
         if &admin != caller {
             return Err(RegistryError::Unauthorized);
         }
