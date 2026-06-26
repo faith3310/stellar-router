@@ -96,6 +96,13 @@ pub struct RouteRegisterInput {
     pub address: Address,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RouteScoreInput {
+    pub name: String,
+    pub score: RouteScore,
+}
+
 /// Scoring attributes for a route used in path selection.
 ///
 /// Higher scores indicate more preferred routes. The composite score is
@@ -148,8 +155,8 @@ pub enum RouterError {
     InvalidMetadata = 9,
     CircularDependency = 10,
     RouteInUse = 11,
-    InvalidAddress = 10,
-    RouteExpired = 10,
+    InvalidAddress = 12,
+    RouteExpired = 13,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -231,8 +238,10 @@ impl RouterCore {
         Self::validate_route_name(&env, &name)?;
 
         // Validate address is not the zero address
-        let zero_address =
-            Address::from_string(&String::from_str(&env, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"));
+        let zero_address = Address::from_string(&String::from_str(
+            &env,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        ));
         if address == zero_address {
             return Err(RouterError::InvalidAddress);
         }
@@ -532,7 +541,7 @@ impl RouterCore {
         Self::remove_aliases_for_route(&env, &name);
 
         // Removing a route may invalidate the cached best route; refresh it.
-        scoring::recompute_best_route(&env);
+        Self::recompute_best_route(&env);
 
         env.events().publish(
             (Symbol::new(&env, router_common::EVENT_ROUTE_REMOVED),),
@@ -685,7 +694,7 @@ impl RouterCore {
         }
 
         // Removing routes may invalidate the cached best route; refresh it once.
-        scoring::recompute_best_route(&env);
+        Self::recompute_best_route(&env);
 
         Ok(result)
     }
@@ -769,7 +778,10 @@ impl RouterCore {
 
         if is_route_expired(&env, &entry) {
             env.events().publish(
-                (Symbol::new(&env, router_common::EVENT_ROUTE_RESOLVE_EXPIRED),),
+                (Symbol::new(
+                    &env,
+                    router_common::EVENT_ROUTE_RESOLVE_EXPIRED,
+                ),),
                 (final_name.clone(),),
             );
             return Err(RouterError::RouteExpired);
@@ -846,7 +858,7 @@ impl RouterCore {
         );
 
         // Pause state affects best-route eligibility; refresh the cache.
-        scoring::recompute_best_route(&env);
+        Self::recompute_best_route(&env);
 
         Ok(())
     }
@@ -1496,11 +1508,52 @@ impl RouterCore {
         );
 
         // Scoring can change which route is best; refresh the cache.
-        scoring::recompute_best_route(&env);
+        Self::recompute_best_route(&env);
 
         Ok(())
     }
+    /// Set scores for multiple routes in a single transaction.
+    pub fn set_route_scores_batch(
+        env: Env,
+        caller: Address,
+        scores: Vec<RouteScoreInput>,
+    ) -> Result<(), RouterError> {
+        caller.require_auth();
+        router_common::require_admin_simple!(&env, &caller, &DataKey::Admin, RouterError)?;
 
+        // Validate every route first.
+        for item in scores.iter() {
+            if !env
+                .storage()
+                .instance()
+                .has(&DataKey::Route(item.name.clone()))
+            {
+                return Err(RouterError::RouteNotFound);
+            }
+        }
+
+        // Apply every score.
+        for item in scores.iter() {
+            env.storage()
+                .instance()
+                .set(&DataKey::Score(item.name.clone()), &item.score);
+
+            env.events().publish(
+                (Symbol::new(&env, "route_scored"),),
+                (
+                    item.name.clone(),
+                    item.score.liquidity_score,
+                    item.score.fee_bps,
+                    item.score.reliability_score,
+                ),
+            );
+        }
+
+        // Refresh the cached best route once.
+        Self::recompute_best_route(&env);
+
+        Ok(())
+    }
     /// Get the score for a route.
     ///
     /// Returns `None` if no score has been set for the route.
@@ -1657,19 +1710,25 @@ impl RouterCore {
             }
         }
 
-        env.storage().instance().set(&DataKey::Aliases, &updated_aliases);
+        env.storage()
+            .instance()
+            .set(&DataKey::Aliases, &updated_aliases);
     }
 
     fn add_alias_internal(env: &Env, alias: &String, target: &String) -> Result<(), RouterError> {
         Self::validate_route_name(env, alias)?;
 
-        env.storage().instance().set(&DataKey::Alias(alias.clone()), target);
+        env.storage()
+            .instance()
+            .set(&DataKey::Alias(alias.clone()), target);
 
         let mut aliases = Self::get_aliases(env);
         if !aliases.contains(alias) {
             aliases.push_back(alias.clone());
             env.storage().instance().set(&DataKey::Aliases, &aliases);
         }
+        Ok(())
+    }
     fn resolve_dependencies_recursive(
         env: &Env,
         name: &String,
@@ -1903,8 +1962,10 @@ impl RouterCore {
         Self::validate_route_name(env, &name)?;
 
         // Validate address is not the zero address
-        let zero_address =
-            Address::from_string(&String::from_str(env, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"));
+        let zero_address = Address::from_string(&String::from_str(
+            env,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        ));
         if address == zero_address {
             return Err(RouterError::InvalidAddress);
         }
@@ -3224,6 +3285,87 @@ mod tests {
     }
 
     #[test]
+    fn test_set_route_scores_batch() {
+        let (env, admin, client) = setup();
+
+        let r1 = String::from_str(&env, "route-a");
+        let r2 = String::from_str(&env, "route-b");
+
+        let addr1 = Address::generate(&env);
+        let addr2 = Address::generate(&env);
+
+        client.register_route(&admin, &r1, &addr1, &None);
+        client.register_route(&admin, &r2, &addr2, &None);
+
+        let scores = vec![
+            &env,
+            RouteScoreInput {
+                name: r1.clone(),
+                score: RouteScore {
+                    liquidity_score: 50,
+                    fee_bps: 20,
+                    reliability_score: 60,
+                },
+            },
+            RouteScoreInput {
+                name: r2.clone(),
+                score: RouteScore {
+                    liquidity_score: 90,
+                    fee_bps: 10,
+                    reliability_score: 95,
+                },
+            },
+        ];
+
+        client.set_route_scores_batch(&admin, &scores);
+
+        let score1 = client.get_route_score(&r1).unwrap();
+        let score2 = client.get_route_score(&r2).unwrap();
+
+        assert_eq!(score1.liquidity_score, 50);
+        assert_eq!(score2.liquidity_score, 90);
+    }
+
+    #[test]
+    fn test_set_route_scores_batch_fails_if_route_missing() {
+        let (env, admin, client) = setup();
+
+        let existing = String::from_str(&env, "route-a");
+        let missing = String::from_str(&env, "missing");
+
+        let addr = Address::generate(&env);
+
+        client.register_route(&admin, &existing, &addr, &None);
+
+        let scores = vec![
+            &env,
+            RouteScoreInput {
+                name: existing.clone(),
+                score: RouteScore {
+                    liquidity_score: 50,
+                    fee_bps: 20,
+                    reliability_score: 60,
+                },
+            },
+            RouteScoreInput {
+                name: missing.clone(),
+                score: RouteScore {
+                    liquidity_score: 90,
+                    fee_bps: 10,
+                    reliability_score: 95,
+                },
+            },
+        ];
+
+        let result = client.try_set_route_scores_batch(&admin, &scores);
+
+        assert_eq!(result, Err(Ok(RouterError::RouteNotFound)));
+
+        // Existing route should still have no score because the batch failed.
+        assert_eq!(client.get_route_score(&existing), None);
+    }
+
+    #[test]
     fn test_get_best_route_selects_highest_score() {
         let (env, admin, client) = setup();
         let r1 = String::from_str(&env, "route-a");
@@ -4211,7 +4353,10 @@ mod tests {
         assert_eq!(client.resolve(&name), addr);
 
         env.ledger().with_mut(|li| li.sequence_number = start + 11);
-        assert_eq!(client.try_resolve(&name), Err(Ok(RouterError::RouteExpired)));
+        assert_eq!(
+            client.try_resolve(&name),
+            Err(Ok(RouterError::RouteExpired))
+        );
     }
 
     #[test]
@@ -4228,7 +4373,10 @@ mod tests {
         let event = env.events().all().last().unwrap().clone();
         assert_eq!(
             event.1,
-            vec![&env, Symbol::new(&env, "route_resolve_expired").into_val(&env)]
+            vec![
+                &env,
+                Symbol::new(&env, "route_resolve_expired").into_val(&env)
+            ]
         );
     }
 
