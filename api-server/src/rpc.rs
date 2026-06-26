@@ -344,6 +344,34 @@ impl SorobanRpcClient {
         }))
     }
 
+    fn decode_string_vec_xdr(xdr: &str) -> Option<Vec<String>> {
+        let bytes = base64_decode(xdr)?;
+        // Parse a minimal XDR Vec<String>: 4-byte big-endian length, then null-terminated strings.
+        if bytes.len() < 4 {
+            return Some(Vec::new());
+        }
+        let count = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        let mut result = Vec::with_capacity(count);
+        let mut pos = 4;
+        for _ in 0..count {
+            if pos + 4 > bytes.len() {
+                break;
+            }
+            let len =
+                u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+                    as usize;
+            pos += 4;
+            if pos + len > bytes.len() {
+                break;
+            }
+            if let Ok(s) = std::str::from_utf8(&bytes[pos..pos + len]) {
+                result.push(s.trim_end_matches('\0').to_string());
+            }
+            pos += (len + 3) & !3;
+        }
+        Some(result)
+    }
+
     async fn call_simulate_rpc(
         &self,
         target: &str,
