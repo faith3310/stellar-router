@@ -138,6 +138,7 @@ pub enum RouterError {
     RouteAlreadyExists = 7,
     InvalidRouteName = 8,
     InvalidMetadata = 9,
+    InvalidScore = 10,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -1200,37 +1201,42 @@ impl RouterCore {
     /// * [`RouterError::RouteNotFound`] — if the route does not exist.
     /// * [`RouterError::NotInitialized`] — if the contract is not initialized.
     pub fn set_route_score(
-        env: Env,
-        caller: Address,
-        name: String,
-        score: RouteScore,
-    ) -> Result<(), RouterError> {
-        caller.require_auth();
-        router_common::require_admin_simple!(&env, &caller, &DataKey::Admin, RouterError)?;
+    env: Env,
+    caller: Address,
+    name: String,
+    score: RouteScore,
+) -> Result<(), RouterError> {
+    caller.require_auth();
+    router_common::require_admin_simple!(&env, &caller, &DataKey::Admin, RouterError)?;
 
-        if !env.storage().instance().has(&DataKey::Route(name.clone())) {
-            return Err(RouterError::RouteNotFound);
-        }
-
-        env.storage()
-            .instance()
-            .set(&DataKey::Score(name.clone()), &score);
-
-        env.events().publish(
-            (Symbol::new(&env, "route_scored"),),
-            (
-                name,
-                score.liquidity_score,
-                score.fee_bps,
-                score.reliability_score,
-            ),
-        );
-
-        // Scoring can change which route is best; refresh the cache.
-        scoring::recompute_best_route(&env);
-
-        Ok(())
+    if !env.storage().instance().has(&DataKey::Route(name.clone())) {
+        return Err(RouterError::RouteNotFound);
     }
+
+    // Scores are expected to be normalized in the range 0..=100.
+    if score.liquidity_score > 100 || score.reliability_score > 100 {
+        return Err(RouterError::InvalidScore);
+    }
+
+    env.storage()
+        .instance()
+        .set(&DataKey::Score(name.clone()), &score);
+
+    env.events().publish(
+        (Symbol::new(&env, "route_scored"),),
+        (
+            name,
+            score.liquidity_score,
+            score.fee_bps,
+            score.reliability_score,
+        ),
+    );
+
+    // Scoring can change which route is best; refresh the cache.
+    scoring::recompute_best_route(&env);
+
+    Ok(())
+}
 
     /// Get the score for a route.
     ///
@@ -1296,7 +1302,9 @@ impl RouterCore {
                 };
 
             // Composite score: liquidity + reliability - fee_bps/10
-            let composite: i64 = score.liquidity_score as i64 + score.reliability_score as i64
+            let composite = (score.liquidity_score as i64)
+                .checked_add(score.reliability_score as i64)
+                .unwrap()
                 - (score.fee_bps as i64 / 10);
 
             if composite > best_score {
@@ -1397,7 +1405,9 @@ impl RouterCore {
                 };
 
             // Composite score: liquidity + reliability - fee_bps/10
-            let composite: i64 = score.liquidity_score as i64 + score.reliability_score as i64
+            let composite = (score.liquidity_score as i64)
+                .checked_add(score.reliability_score as i64)
+                .unwrap()
                 - (score.fee_bps as i64 / 10);
 
             if composite > best_score {
@@ -1493,6 +1503,7 @@ impl RouterCore {
             RouterError::RouteAlreadyExists => "RouteAlreadyExists",
             RouterError::InvalidRouteName => "InvalidRouteName",
             RouterError::InvalidMetadata => "InvalidMetadata",
+            RouterError::InvalidScore => "InvalidScore",
         }
     }
 
@@ -1654,6 +1665,15 @@ mod tests {
         assert_eq!(emitted_addr, addr);
     }
 
+    #[test]
+    fn test_set_route_score_rejects_liquidity_above_100()
+
+    #[test]
+    fn test_set_route_score_rejects_reliability_above_100()
+    
+    #[test]
+    fn test_best_route_score_calculation_still_works()
+    
     #[test]
     fn test_update_route() {
         let (env, admin, client) = setup();
