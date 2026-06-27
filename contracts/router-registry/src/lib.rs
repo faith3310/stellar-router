@@ -568,6 +568,13 @@ impl RouterRegistry {
     /// # Returns
     /// An [`Option<ContractEntry>`] containing the entry if found, `None` otherwise.
     pub fn get_entry_by_address(env: Env, address: Address) -> Option<ContractEntry> {
+        let (name, version): (String, u32) = env
+            .storage()
+            .instance()
+            .get(&DataKey::AddressIndex(address))?;
+        env.storage()
+            .instance()
+            .get(&DataKey::Entry(name, version))
         let (name, version) = env
             .storage()
             .instance()
@@ -830,6 +837,7 @@ mod tests {
         let addr2 = Address::generate(&env);
         client.register(&admin, &name, &addr1, &1);
         client.register(&admin, &name, &addr2, &2);
+        client.deprecate(&admin, &name, &2, &None::<String>);
         client.deprecate(&admin, &name, &2, &None);
         // latest should now return v1
         let latest = client.get_latest(&name);
@@ -842,6 +850,7 @@ mod tests {
         let name = String::from_str(&env, "oracle");
         let addr = Address::generate(&env);
         client.register(&admin, &name, &addr, &1);
+        let result = client.try_deprecate(&admin, &name, &99, &None::<String>);
         let result = client.try_deprecate(&admin, &name, &99, &None);
         assert_eq!(result, Err(Ok(RegistryError::VersionNotFound)));
     }
@@ -860,6 +869,7 @@ mod tests {
         let name = String::from_str(&env, "oracle");
         let addr = Address::generate(&env);
         client.register(&admin, &name, &addr, &1);
+        client.deprecate(&admin, &name, &1, &None::<String>);
         client.deprecate(&admin, &name, &1, &None);
         let result = client.try_get_latest(&name);
         assert_eq!(result, Err(Ok(RegistryError::AllVersionsDeprecated)));
@@ -877,6 +887,8 @@ mod tests {
         client.register(&admin, &name, &a1, &1);
         client.register(&admin, &name, &a2, &2);
         client.register(&admin, &name, &a3, &3);
+        client.deprecate(&admin, &name, &3, &None::<String>);
+        client.deprecate(&admin, &name, &2, &None::<String>);
         client.deprecate(&admin, &name, &3, &None);
         client.deprecate(&admin, &name, &2, &None);
         let latest = client.get_latest(&name);
@@ -948,6 +960,7 @@ mod tests {
         let name = String::from_str(&env, "oracle");
         let addr = Address::generate(&env);
         client.register(&admin, &name, &addr, &1);
+        client.deprecate(&admin, &name, &1, &None::<String>);
         client.deprecate(&admin, &name, &1, &None);
 
         let event = env.events().all().last().unwrap().clone();
@@ -988,6 +1001,7 @@ mod tests {
         let name = String::from_str(&env, "oracle");
         let addr = Address::generate(&env);
         client.register(&admin, &name, &addr, &1);
+        client.deprecate(&admin, &name, &1, &None::<String>);
         client.deprecate(&admin, &name, &1, &None);
 
         // Registering a higher version after deprecation should succeed
@@ -1003,6 +1017,8 @@ mod tests {
         let addr = Address::generate(&env);
         client.register(&admin, &name, &addr, &1);
         client.register(&admin, &name, &addr, &2);
+        client.deprecate(&admin, &name, &1, &None::<String>);
+        client.deprecate(&admin, &name, &2, &None::<String>);
         client.deprecate(&admin, &name, &1, &None);
         client.deprecate(&admin, &name, &2, &None);
 
@@ -1272,6 +1288,7 @@ mod tests {
         client.register(&admin, &name, &a1, &1);
         client.register(&admin, &name, &a2, &2);
         client.register(&admin, &name, &a3, &3);
+        client.deprecate(&admin, &name, &3, &None::<String>);
         client.deprecate(&admin, &name, &3, &None);
 
         let constraint = String::from_str(&env, ">=2");
@@ -1293,6 +1310,9 @@ mod tests {
         client.register(&admin, &name, &a1, &1);
         client.register(&admin, &name, &a2, &2);
         client.register(&admin, &name, &a3, &3);
+        client.deprecate(&admin, &name, &1, &None::<String>);
+        client.deprecate(&admin, &name, &2, &None::<String>);
+        client.deprecate(&admin, &name, &3, &None::<String>);
         client.deprecate(&admin, &name, &1, &None);
         client.deprecate(&admin, &name, &2, &None);
         client.deprecate(&admin, &name, &3, &None);
@@ -1343,6 +1363,9 @@ mod tests {
         client.register(&admin, &name, &addr, &1);
         client.register(&admin, &name, &addr, &2);
         client.register(&admin, &name, &addr, &3);
+        client.deprecate(&admin, &name, &1, &None::<String>);
+        client.deprecate(&admin, &name, &2, &None::<String>);
+        client.deprecate(&admin, &name, &3, &None::<String>);
         client.deprecate(&admin, &name, &1, &None);
         client.deprecate(&admin, &name, &2, &None);
         client.deprecate(&admin, &name, &3, &None);
@@ -1412,6 +1435,7 @@ mod tests {
         let a2 = Address::generate(&env);
         client.register(&admin, &name, &a1, &1);
         client.register(&admin, &name, &a2, &2);
+        client.deprecate(&admin, &name, &1, &None::<String>);
         client.deprecate(&admin, &name, &1, &None);
 
         let entries = client.get_all_versions(&name);
@@ -1427,6 +1451,86 @@ mod tests {
         let (env, _admin, client) = setup();
         let name = String::from_str(&env, "unknown");
         assert!(client.get_all_versions(&name).is_empty());
+    }
+
+    #[test]
+    fn test_deprecate_all_versions() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let (a1, a2, a3) = (
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+        );
+        client.register(&admin, &name, &a1, &1);
+        client.register(&admin, &name, &a2, &2);
+        client.register(&admin, &name, &a3, &3);
+
+        client.deprecate_all_versions(&admin, &name, &None::<String>);
+
+        let result = client.try_get_latest(&name);
+        assert_eq!(result, Err(Ok(RegistryError::AllVersionsDeprecated)));
+        // All entries should be marked deprecated
+        for v in [1u32, 2, 3] {
+            assert!(client.get(&name, &v).deprecated);
+        }
+    }
+
+    #[test]
+    fn test_deprecate_all_versions_skips_already_deprecated() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let addr = Address::generate(&env);
+        client.register(&admin, &name, &addr, &1);
+        // Pre-deprecate v1
+        client.deprecate(&admin, &name, &1, &None::<String>);
+        // deprecate_all_versions must not error on already-deprecated entries
+        assert!(client
+            .try_deprecate_all_versions(&admin, &name, &None::<String>)
+            .is_ok());
+    }
+
+    #[test]
+    fn test_deprecate_with_reason_stored_and_emitted() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let addr = Address::generate(&env);
+        let reason = String::from_str(&env, "security vulnerability in v1");
+        client.register(&admin, &name, &addr, &1);
+        client.deprecate(&admin, &name, &1, &Some(reason.clone()));
+
+        let entry = client.get(&name, &1);
+        assert!(entry.deprecated);
+        assert_eq!(entry.deprecation_reason, Some(reason.clone()));
+
+        let event = env.events().all().last().unwrap().clone();
+        let (n, v, r): (String, u32, Option<String>) = event.2.into_val(&env);
+        assert_eq!(n, name);
+        assert_eq!(v, 1u32);
+        assert_eq!(r, Some(reason));
+    }
+
+    #[test]
+    fn test_get_latest_with_constraint_version_zero_matching() {
+        // version 0 is not allowed to be registered, but constraint >=0 should match version 1
+    fn test_get_entry_by_address_found() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let addr = Address::generate(&env);
+        client.register(&admin, &name, &addr, &1);
+
+        let constraint = String::from_str(&env, ">=0");
+        let result = client.get_latest_with_constraint(&name, &Some(constraint));
+        assert_eq!(result.version, 1);
+    }
+
+    #[test]
+    fn test_deprecate_all_versions_unauthorized_fails() {
+        let (env, _admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let attacker = Address::generate(&env);
+        let result = client.try_deprecate_all_versions(&attacker, &name, &None::<String>);
+        assert_eq!(result, Err(Ok(RegistryError::Unauthorized)));
     }
 
     #[test]
@@ -1453,7 +1557,46 @@ mod tests {
         let (env, admin, client) = setup();
         let name = String::from_str(&env, "oracle");
         let addr = Address::generate(&env);
+        let reason = String::from_str(&env, "security vulnerability");
         client.register(&admin, &name, &addr, &1);
+        client.deprecate(&admin, &name, &1, &Some(reason.clone()));
+        let entry = client.get(&name, &1);
+        assert!(entry.deprecated);
+        assert_eq!(entry.deprecation_reason, Some(reason));
+    }
+
+    #[test]
+    fn test_get_latest_with_constraint_large_version() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let addr = Address::generate(&env);
+        let large_v = u32::MAX;
+        client.register(&admin, &name, &addr, &large_v);
+
+        let constraint = String::from_str(&env, "4294967295"); // u32::MAX
+        let result = client.get_latest_with_constraint(&name, &Some(constraint));
+        assert_eq!(result.version, large_v);
+
+        let gte_constraint = String::from_str(&env, ">=4294967295");
+        let result_gte = client.get_latest_with_constraint(&name, &Some(gte_constraint));
+        assert_eq!(result_gte.version, large_v);
+    }
+
+    #[test]
+    fn test_get_latest_with_constraint_caret_zero() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let addr = Address::generate(&env);
+        client.register(&admin, &name, &addr, &1);
+
+        // ^0 means >=0 and <1. Since version 1 is registered, ^0 should NOT match.
+        let constraint = String::from_str(&env, "^0");
+        let result = client.try_get_latest_with_constraint(&name, &Some(constraint));
+        assert_eq!(result, Err(Ok(RegistryError::NotFound)));
+    }
+
+    #[test]
+    fn test_get_entry_by_address_none_after_deprecate() {
         let reason = String::from_str(&env, "security vulnerability");
         client.deprecate(&admin, &name, &1, &Some(reason.clone()));
         let entry = client.get(&name, &1);
@@ -1519,5 +1662,128 @@ mod tests {
         let result = client.try_register_with_check(&admin, &name, &1, &mock_id, &Some(health_fn));
         assert_eq!(result, Err(Ok(RegistryError::ContractUnreachable)));
         assert_eq!(client.try_get(&name, &1), Err(Ok(RegistryError::NotFound)));
+    }
+
+    // ── Issue #644: version constraint parsing edge cases ────────────────────
+
+    #[test]
+    fn test_constraint_whitespace_only_is_invalid() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let addr = Address::generate(&env);
+        client.register(&admin, &name, &addr, &1);
+        let result = client.try_get_latest_with_constraint(
+            &name,
+            &Some(String::from_str(&env, " ")),
+        );
+        assert_eq!(result, Err(Ok(RegistryError::InvalidConstraint)));
+    }
+
+    #[test]
+    fn test_constraint_mixed_operator_is_invalid() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let addr = Address::generate(&env);
+        client.register(&admin, &name, &addr, &1);
+        // "~=2" starts with tilde but the rest "=2" is not a valid u32
+        let result = client.try_get_latest_with_constraint(
+            &name,
+            &Some(String::from_str(&env, "~=2")),
+        );
+        assert_eq!(result, Err(Ok(RegistryError::InvalidConstraint)));
+    }
+
+    #[test]
+    fn test_constraint_negative_number_is_invalid() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let addr = Address::generate(&env);
+        client.register(&admin, &name, &addr, &1);
+        // ">=-1": "-1" cannot parse as u32
+        let result = client.try_get_latest_with_constraint(
+            &name,
+            &Some(String::from_str(&env, ">=-1")),
+        );
+        assert_eq!(result, Err(Ok(RegistryError::InvalidConstraint)));
+    }
+
+    #[test]
+    fn test_constraint_equals_prefix_is_invalid() {
+        // "=3" is not a supported operator — falls to numeric parse of "=3" → fails
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let addr1 = Address::generate(&env);
+        let addr2 = Address::generate(&env);
+        client.register(&admin, &name, &addr1, &1);
+        client.register(&admin, &name, &addr2, &3);
+        let result = client.try_get_latest_with_constraint(
+            &name,
+            &Some(String::from_str(&env, "=3")),
+        );
+        assert_eq!(result, Err(Ok(RegistryError::InvalidConstraint)));
+    }
+
+    #[test]
+    fn test_constraint_exact_numeric_match() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let (a1, a2, a3, a4) = (
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+        );
+        client.register(&admin, &name, &a1, &1);
+        client.register(&admin, &name, &a2, &2);
+        client.register(&admin, &name, &a3, &3);
+        client.register(&admin, &name, &a4, &4);
+
+        let result = client.get_latest_with_constraint(
+            &name,
+            &Some(String::from_str(&env, "3")),
+        );
+        assert_eq!(result.version, 3);
+    }
+
+    #[test]
+    fn test_constraint_gt_operator() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let (a1, a2, a3) = (
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+        );
+        client.register(&admin, &name, &a1, &1);
+        client.register(&admin, &name, &a2, &2);
+        client.register(&admin, &name, &a3, &3);
+
+        // ">2" means version strictly greater than 2 → only 3 qualifies
+        let result = client.get_latest_with_constraint(
+            &name,
+            &Some(String::from_str(&env, ">2")),
+        );
+        assert_eq!(result.version, 3);
+    }
+
+    #[test]
+    fn test_constraint_lte_operator() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let (a1, a2, a3) = (
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+        );
+        client.register(&admin, &name, &a1, &1);
+        client.register(&admin, &name, &a2, &2);
+        client.register(&admin, &name, &a3, &3);
+
+        // "<=2" returns highest non-deprecated version ≤ 2 → version 2
+        let result = client.get_latest_with_constraint(
+            &name,
+            &Some(String::from_str(&env, "<=2")),
+        );
+        assert_eq!(result.version, 2);
     }
 }

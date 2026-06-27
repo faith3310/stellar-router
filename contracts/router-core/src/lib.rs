@@ -2804,8 +2804,6 @@ mod tests {
         assert!(!has_metadata);
     }
 
-    // ── RouteMetadata validation tests (issues #180 & #191) ──────────────────
-
     #[test]
     fn test_set_route_paused_updates_updated_by() {
         let (env, admin, client) = setup();
@@ -3555,6 +3553,34 @@ mod tests {
         assert_eq!(result, Err(Ok(RouterError::InvalidRouteName)));
     }
 
+    // ── Issue #645: remove_route alias cleanup ────────────────────────────────
+
+    #[test]
+    fn test_remove_route_cleans_up_multiple_aliases() {
+        let (env, admin, client) = setup();
+        let oracle = String::from_str(&env, "oracle");
+        let orcl = String::from_str(&env, "orcl");
+        let price_feed = String::from_str(&env, "price-feed");
+        let addr = Address::generate(&env);
+
+        client.register_route(&admin, &oracle, &addr, &None);
+        client.add_alias(&admin, &oracle, &orcl);
+        client.add_alias(&admin, &oracle, &price_feed);
+
+        assert_eq!(client.resolve(&orcl), addr);
+        assert_eq!(client.resolve(&price_feed), addr);
+
+        client.remove_route(&admin, &oracle);
+
+        assert_eq!(client.get_alias_target(&orcl), None);
+        assert_eq!(client.get_alias_target(&price_feed), None);
+        assert_eq!(
+            client.try_resolve(&orcl),
+            Err(Ok(RouterError::RouteNotFound))
+        );
+        assert_eq!(
+            client.try_resolve(&price_feed),
+            Err(Ok(RouterError::RouteNotFound))
     #[test]
     fn test_route_count() {
         let (env, admin, client) = setup();
@@ -3657,6 +3683,88 @@ mod tests {
     }
 
     #[test]
+    fn test_remove_route_preserves_unrelated_aliases() {
+        let (env, admin, client) = setup();
+        let oracle = String::from_str(&env, "oracle");
+        let dex = String::from_str(&env, "dex");
+        let oracle_alias = String::from_str(&env, "oracle_v1");
+        let dex_alias = String::from_str(&env, "dex_v1");
+        let addr1 = Address::generate(&env);
+        let addr2 = Address::generate(&env);
+
+        client.register_route(&admin, &oracle, &addr1, &None);
+        client.register_route(&admin, &dex, &addr2, &None);
+        client.add_alias(&admin, &oracle, &oracle_alias);
+        client.add_alias(&admin, &dex, &dex_alias);
+
+        client.remove_route(&admin, &oracle);
+
+        // dex alias must still resolve correctly
+        assert_eq!(client.resolve(&dex_alias), addr2);
+        assert_eq!(client.get_alias_target(&dex_alias), Some(dex.clone()));
+
+        // oracle alias must be gone
+        assert_eq!(client.get_alias_target(&oracle_alias), None);
+    }
+
+    #[test]
+    fn test_remove_route_double_removal_returns_error() {
+        let (env, admin, client) = setup();
+        let oracle = String::from_str(&env, "oracle");
+        let addr = Address::generate(&env);
+
+        client.register_route(&admin, &oracle, &addr, &None);
+        client.remove_route(&admin, &oracle);
+
+        let result = client.try_remove_route(&admin, &oracle);
+        assert_eq!(result, Err(Ok(RouterError::RouteNotFound)));
+    }
+
+    #[test]
+    fn test_reregister_after_remove_does_not_resurrect_aliases() {
+        let (env, admin, client) = setup();
+        let oracle = String::from_str(&env, "oracle");
+        let alias = String::from_str(&env, "oracle_v1");
+        let addr1 = Address::generate(&env);
+        let addr2 = Address::generate(&env);
+
+        client.register_route(&admin, &oracle, &addr1, &None);
+        client.add_alias(&admin, &oracle, &alias);
+
+        client.remove_route(&admin, &oracle);
+
+        // Re-register with a new address
+        client.register_route(&admin, &oracle, &addr2, &None);
+
+        // Old alias must NOT be resurrected
+        assert_eq!(client.get_alias_target(&alias), None);
+        assert_eq!(
+            client.try_resolve(&alias),
+            Err(Ok(RouterError::RouteNotFound))
+        );
+        // Route itself resolves to new address
+        assert_eq!(client.resolve(&oracle), addr2);
+    }
+
+    #[test]
+    fn test_remove_route_alias_count_consistency() {
+        let (env, admin, client) = setup();
+        let oracle = String::from_str(&env, "oracle");
+        let alias1 = String::from_str(&env, "oracle_v1");
+        let alias2 = String::from_str(&env, "oracle_v2");
+        let addr = Address::generate(&env);
+
+        client.register_route(&admin, &oracle, &addr, &None);
+        client.add_alias(&admin, &oracle, &alias1);
+        client.add_alias(&admin, &oracle, &alias2);
+
+        client.remove_route(&admin, &oracle);
+
+        // Neither alias should have a target anymore
+        assert!(client.get_alias_target(&alias1).is_none());
+        assert!(client.get_alias_target(&alias2).is_none());
+        // Route itself is gone
+        assert!(client.get_route(&oracle).is_none());
     fn test_batch_resolve_paused_route_returns_err() {
         let (env, admin, client) = setup();
         let oracle = String::from_str(&env, "oracle");
