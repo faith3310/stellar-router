@@ -10,7 +10,9 @@ mod tests;
 use anyhow::{Context, Result};
 use axum::{
     extract::DefaultBodyLimit,
-    http::{header, Method},
+    http::{header, HeaderValue, Method, Request},
+    middleware::{self, Next},
+    response::Response,
     routing::{get, post},
     Router,
 };
@@ -18,6 +20,7 @@ use clap::Parser;
 use std::net::SocketAddr;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{info, warn};
+use tracing::{info, info_span, warn, Instrument};
 
 use crate::state::AppState;
 
@@ -81,6 +84,7 @@ async fn main() -> Result<()> {
         .route("/routes", get(handlers::list_routes))
         .route("/routes/:name", get(handlers::get_route))
         .route("/ws", get(websocket::ws_handler))
+        .layer(middleware::from_fn(request_id_middleware))
         .layer(cors)
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .with_state(state);
@@ -108,6 +112,38 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Attach a unique `request_id` (UUID v4) to every request span and response header.
+///
+/// All logs emitted while handling the request inherit the `request_id` field
+/// from the enclosing span, enabling correlation across log lines for a single
+/// request. The ID is also returned to the client in the `X-Request-Id` header.
+async fn request_id_middleware(req: Request<axum::body::Body>, next: Next) -> Response {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+
+    let span = info_span!(
+        "http_request",
+        request_id = %request_id,
+        method = %method,
+        uri = %uri,
+    );
+
+    async move {
+        info!(request_id = %request_id, %method, %uri, "incoming request");
+        let mut response = next.run(req).await;
+        let status = response.status().as_u16();
+        info!(request_id = %request_id, status, "request complete");
+
+        if let Ok(val) = HeaderValue::from_str(&request_id) {
+            response.headers_mut().insert("x-request-id", val);
+        }
+        response
+    }
+    .instrument(span)
+    .await
 }
 
 fn build_cors_layer(origins: &[String]) -> CorsLayer {

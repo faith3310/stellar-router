@@ -16,6 +16,7 @@ use alloc::string::ToString;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Val, Vec,
 };
+use router_common;
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
@@ -414,7 +415,7 @@ impl RouterRegistry {
             .instance()
             .set(&DataKey::Entry(name.clone(), version), &entry);
         env.events()
-            .publish((Symbol::new(&env, "contract_deprecated"),), (name, version));
+            .publish((Symbol::new(&env, router_common::EVENT_CONTRACT_DEPRECATED),), (name, version));
         Ok(())
     }
 
@@ -467,7 +468,7 @@ impl RouterRegistry {
         Self::require_admin(&env, &current)?;
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         env.events().publish(
-            (Symbol::new(&env, "admin_transferred"),),
+            (Symbol::new(&env, router_common::EVENT_ADMIN_TRANSFERRED),),
             (current, new_admin),
         );
         Ok(())
@@ -657,7 +658,7 @@ impl RouterRegistry {
             .set(&DataKey::AddressIndex(address), &(name.clone(), version));
 
         env.events()
-            .publish((Symbol::new(env, "contract_registered"),), (name, version));
+            .publish((Symbol::new(env, router_common::EVENT_CONTRACT_REGISTERED),), (name, version));
 
         Ok(())
     }
