@@ -47,8 +47,7 @@ pub enum DataKey {
     TotalErrors,
     BackoffBaseMs,     // base delay in milliseconds before first retry
     BackoffMultiplier, // multiplier applied each retry (stored as fixed-point *100, e.g. 200 = 2x)
-    ExecHistory,       // Vec<ExecutionRecord>
-    ExecHistory,   // Vec<ExecutionRecord>, capped at MaxHistorySize (oldest evicted first)
+    ExecHistory,       // Vec<ExecutionRecord>, capped at MaxHistorySize (oldest evicted first)
     MaxHistorySize, // u32 — cap on ExecHistory length
 }
 
