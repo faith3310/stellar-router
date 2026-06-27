@@ -17,7 +17,6 @@ use axum::{
 use clap::Parser;
 use std::net::SocketAddr;
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use tracing::info;
 use tracing::{info, warn};
 
 use crate::state::AppState;
@@ -130,6 +129,8 @@ fn build_cors_layer(origins: &[String]) -> CorsLayer {
         .allow_origin(allow_origin)
         .allow_methods(allow_methods)
         .allow_headers(allow_headers)
+}
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
