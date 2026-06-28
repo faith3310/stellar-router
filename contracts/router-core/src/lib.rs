@@ -737,15 +737,22 @@ impl RouterCore {
         }
 
         // Resolve alias if present
-        let resolved_name = if let Some(original) = env
+        let (resolved_name, alias_used) = if let Some(original) = env
             .storage()
             .instance()
             .get::<DataKey, String>(&DataKey::Alias(name.clone()))
         {
-            original
+            (original, true)
         } else {
-            name.clone()
+            (name.clone(), false)
         };
+
+        if alias_used {
+            env.events().publish(
+                (Symbol::new(&env, router_common::EVENT_ALIAS_RESOLVED),),
+                (name.clone(), resolved_name.clone()),
+            );
+        }
 
         // Score-based selection: the best non-paused scored route is maintained
         // in a cached storage key (DataKey::BestRoute), updated whenever scores,
@@ -2366,7 +2373,7 @@ mod tests {
             event.1,
             vec![
                 &env,
-                Symbol::new(&env, "route_resolve_paused").into_val(&env)
+                Symbol::new(&env, router_common::EVENT_ROUTE_RESOLVE_PAUSED).into_val(&env)
             ]
         );
         let (emitted_name,): (String,) = event.2.into_val(&env);
@@ -3122,7 +3129,7 @@ mod tests {
             event.1,
             vec![
                 &env,
-                Symbol::new(&env, "route_resolve_paused").into_val(&env)
+                Symbol::new(&env, router_common::EVENT_ROUTE_RESOLVE_PAUSED).into_val(&env)
             ]
         );
         let (emitted_name,): (String,) = event.2.into_val(&env);
