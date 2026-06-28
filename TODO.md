@@ -1,5 +1,10 @@
-- [x] Verify sortedness invariant for `versions()` ordering in `contracts/router-registry/src/lib.rs`
-- [ ] Add tests asserting `versions()` is ascending after sequential registers
-- [ ] Add/adjust docs to clarify ordering guarantee
-- [ ] Run `cargo test -p router-registry`
+# TODO
+
+- [ ] Update `contracts/router-access/src/lib.rs` storage: add `DataKey::RoleMemberCount(String)`.
+- [ ] Add view function `get_role_member_count(role: String) -> u32`.
+- [ ] Maintain counter in `grant_role_internal`.
+- [ ] Maintain counter in `revoke_role`.
+- [ ] Maintain counter in `expire_role`.
+- [ ] Add/extend unit tests for member count behavior.
+- [ ] Run `cargo test` to verify compilation + passing tests.
 
